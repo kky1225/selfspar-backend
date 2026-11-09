@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'accounts',
     'projects',
 ]
 
@@ -79,6 +80,9 @@ LOGIN_URL = 'login'  # 로그인하지 않았을 때 보낼 화면
 LOGIN_REDIRECT_URL = 'home'  # 로그인에 성공하면 갈 화면
 LOGOUT_REDIRECT_URL = 'login'  # 로그아웃하면 갈 화면
 
+# 로그인 확인 방법: Django 기본 방법에 계정 잠금(실패가 쌓이면 잠금 시간이 길어짐)을 더했다.
+AUTHENTICATION_BACKENDS = ['accounts.backends.LockoutModelBackend']
+
 
 # API: Django 로그인 세션으로 사용자를 확인하고, 모든 API를 기본으로 잠근다.
 # DRF의 기본값은 아무나 허용이어서 직접 적는다.
@@ -89,6 +93,13 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
+    # 비밀번호를 바꿔 가며 계속 넣어 보는 공격을 막는다.
+    'DEFAULT_THROTTLE_RATES': {
+        'login': '5/min',
+    },
+    # 요청자가 X-Forwarded-For 헤더에 아무 주소나 넣어 제한을 피하지 못하게,
+    # 이 헤더는 무시하고 실제 접속 주소로 센다.
+    'NUM_PROXIES': 0,
 }
 
 

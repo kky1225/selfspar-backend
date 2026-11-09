@@ -23,6 +23,7 @@ urlpatterns = [
     # 인증 처리는 직접 짜지 않고 Django 기본 뷰를 쓴다.
     path('login/', auth_views.LoginView.as_view(), name='login'),
     path('logout/', auth_views.LogoutView.as_view(), name='logout'),
+    path('api/auth/', include('accounts.api_urls')),
     path('api/', include('projects.api_urls')),
     path('', include('projects.urls')),
 ]
