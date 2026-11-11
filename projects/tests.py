@@ -1,5 +1,5 @@
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import Client, TestCase
 from django.urls import reverse
 
 from .models import Project, Target
@@ -249,10 +249,95 @@ class ProjectListApiTests(TestCase):
 
         self.assertEqual([item['name'] for item in response.json()], ['나중 등록', '먼저 등록'])
 
-    def test_POST는_지원하지_않는다(self):
+
+class ProjectCreateApiTests(TestCase):
+    def setUp(self):
+        self.url = reverse('api_project_list')
+        self.user = get_user_model().objects.create_user('tester', password='correct-horse-battery')
         self.client.force_login(self.user)
 
-        response = self.client.post(self.url, {'name': 'investfeed'})
+    def create(self, data, client=None):
+        return (client or self.client).post(self.url, data, content_type='application/json')
 
-        self.assertEqual(response.status_code, 405)
+    def test_등록하면_201이고_저장된다(self):
+        response = self.create({
+            'name': 'investfeed',
+            'description': '금융 피드 서비스',
+            'stack': 'Spring Boot, React',
+        })
+
+        self.assertEqual(response.status_code, 201)
+        project = Project.objects.get()
+        self.assertEqual(project.name, 'investfeed')
+        self.assertEqual(project.description, '금융 피드 서비스')
+        self.assertEqual(project.stack, 'Spring Boot, React')
+        body = response.json()
+        self.assertEqual(body['id'], project.pk)
+        self.assertEqual(body['name'], 'investfeed')
+        self.assertEqual(body['target_count'], 0)
+        self.assertIn('created_at', body)
+
+    def test_이름만_입력해도_등록된다(self):
+        response = self.create({'name': 'purefi'})
+
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(Project.objects.filter(name='purefi').exists())
+
+    def test_이름이_비면_400이다(self):
+        for data in ({}, {'name': ''}, {'name': '   '}):
+            with self.subTest(data=data):
+                response = self.create(data)
+
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.json()['name'], ['이름을 입력하세요.'])
+        self.assertFalse(Project.objects.exists())
+
+    def test_이름이_같으면_400이다(self):
+        Project.objects.create(name='investfeed')
+
+        response = self.create({'name': 'investfeed'})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['name'], ['같은 이름의 프로젝트가 이미 있습니다.'])
+        self.assertEqual(Project.objects.count(), 1)
+
+    def test_이름이_100자를_넘으면_400이다(self):
+        self.assertEqual(self.create({'name': 'a' * 100}).status_code, 201)
+
+        response = self.create({'name': 'b' * 101})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('name', response.json())
+        self.assertEqual(Project.objects.count(), 1)
+
+    def test_읽기_전용_칸은_보내도_무시된다(self):
+        response = self.create({
+            'name': 'investfeed',
+            'id': 999,
+            'target_count': 5,
+            'created_at': '2000-01-01T00:00:00Z',
+        })
+
+        self.assertEqual(response.status_code, 201)
+        project = Project.objects.get()
+        self.assertNotEqual(project.pk, 999)
+        self.assertNotEqual(project.created_at.year, 2000)
+        self.assertEqual(response.json()['target_count'], 0)
+
+    def test_로그인하지_않으면_403이고_저장되지_않는다(self):
+        self.client.logout()
+
+        response = self.create({'name': 'investfeed'})
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Project.objects.exists())
+
+    def test_CSRF_토큰_없이_보내면_403이고_저장되지_않는다(self):
+        # 테스트 클라이언트는 기본으로 CSRF 검사를 건너뛰어서, 검사를 켠 클라이언트로 확인한다.
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+
+        response = self.create({'name': 'investfeed'}, client=client)
+
+        self.assertEqual(response.status_code, 403)
         self.assertFalse(Project.objects.exists())
