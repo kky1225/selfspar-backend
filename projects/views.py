@@ -17,7 +17,8 @@ class ProjectListView(ListView):
 class ProjectCreateView(CreateView):
     model = Project
     # 화면에서 입력받을 칸만 적는다. created_at은 자동으로 채워진다.
-    fields = ['name', 'description', 'stack']
+    # 기술 스택은 React 등록 화면에서만 입력한다. 이 템플릿 화면은 React로 옮긴 뒤 지운다.
+    fields = ['name', 'description']
     success_url = reverse_lazy('home')
 
 

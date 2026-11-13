@@ -7,7 +7,8 @@ class Project(models.Model):
     # 이름으로 서비스를 구분하므로 중복을 막는다.
     name = models.CharField('이름', max_length=100, unique=True)
     description = models.TextField('설명', blank=True)
-    stack = models.CharField('기술 스택', max_length=200, blank=True)
+    # 기술 이름 목록. 예: ["Spring Boot", "Kotlin"]
+    stack = models.JSONField('기술 스택', default=list, blank=True)
     created_at = models.DateTimeField('등록일', auto_now_add=True)
 
     class Meta:

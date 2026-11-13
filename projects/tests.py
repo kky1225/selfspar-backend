@@ -31,14 +31,13 @@ class ProjectTests(TestCase):
         response = self.client.post(reverse('project_create'), {
             'name': 'investfeed',
             'description': '금융 피드 서비스',
-            'stack': 'Spring Boot, React',
         })
 
         self.assertRedirects(response, reverse('home'))
         project = Project.objects.get()
         self.assertEqual(project.name, 'investfeed')
         self.assertEqual(project.description, '금융 피드 서비스')
-        self.assertEqual(project.stack, 'Spring Boot, React')
+        self.assertEqual(project.stack, [])
 
     def test_이름만_입력해도_등록된다(self):
         self.client.post(reverse('project_create'), {'name': 'purefi'})
@@ -225,7 +224,7 @@ class ProjectListApiTests(TestCase):
 
     def test_프로젝트_목록을_JSON으로_돌려준다(self):
         self.client.force_login(self.user)
-        project = Project.objects.create(name='investfeed', description='금융', stack='Spring Boot')
+        project = Project.objects.create(name='investfeed', description='금융', stack=['Spring Boot', 'Kotlin'])
         Target.objects.create(project=project, name='운영 API', kind='api', environment='prod')
 
         response = self.client.get(self.url)
@@ -236,7 +235,7 @@ class ProjectListApiTests(TestCase):
         self.assertEqual(item['id'], project.pk)
         self.assertEqual(item['name'], 'investfeed')
         self.assertEqual(item['description'], '금융')
-        self.assertEqual(item['stack'], 'Spring Boot')
+        self.assertEqual(item['stack'], ['Spring Boot', 'Kotlin'])
         self.assertEqual(item['target_count'], 1)
         self.assertIn('created_at', item)
 
@@ -263,17 +262,18 @@ class ProjectCreateApiTests(TestCase):
         response = self.create({
             'name': 'investfeed',
             'description': '금융 피드 서비스',
-            'stack': 'Spring Boot, React',
+            'stack': ['Spring Boot', 'React'],
         })
 
         self.assertEqual(response.status_code, 201)
         project = Project.objects.get()
         self.assertEqual(project.name, 'investfeed')
         self.assertEqual(project.description, '금융 피드 서비스')
-        self.assertEqual(project.stack, 'Spring Boot, React')
+        self.assertEqual(project.stack, ['Spring Boot', 'React'])
         body = response.json()
         self.assertEqual(body['id'], project.pk)
         self.assertEqual(body['name'], 'investfeed')
+        self.assertEqual(body['stack'], ['Spring Boot', 'React'])
         self.assertEqual(body['target_count'], 0)
         self.assertIn('created_at', body)
 
@@ -281,7 +281,37 @@ class ProjectCreateApiTests(TestCase):
         response = self.create({'name': 'purefi'})
 
         self.assertEqual(response.status_code, 201)
-        self.assertTrue(Project.objects.filter(name='purefi').exists())
+        self.assertEqual(Project.objects.get(name='purefi').stack, [])
+
+    def test_기술_스택의_빈_칸과_중복은_정리한다(self):
+        response = self.create({'name': 'investfeed', 'stack': ['  Django ', '', '   ', 'django', 'React', 'react ']})
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Project.objects.get().stack, ['Django', 'React'])
+
+    def test_기술_이름이_50자를_넘으면_400이다(self):
+        self.assertEqual(self.create({'name': 'ok', 'stack': ['a' * 50]}).status_code, 201)
+
+        response = self.create({'name': 'too-long', 'stack': ['b' * 51]})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['stack'], ['기술 이름은 50자 이하로 입력하세요.'])
+
+    def test_기술_스택은_20개까지다(self):
+        stack = [f'tech{i}' for i in range(21)]
+        self.assertEqual(self.create({'name': 'ok', 'stack': stack[:20]}).status_code, 201)
+
+        response = self.create({'name': 'too-many', 'stack': stack})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['stack'], ['기술 스택은 20개까지 입력할 수 있습니다.'])
+
+    def test_기술_스택이_목록이_아니면_400이다(self):
+        response = self.create({'name': 'investfeed', 'stack': 'Spring Boot, React'})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('stack', response.json())
+        self.assertFalse(Project.objects.exists())
 
     def test_이름이_비면_400이다(self):
         for data in ({}, {'name': ''}, {'name': '   '}):

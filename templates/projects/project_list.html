@@ -23,7 +23,7 @@
             <td><a href="{% url 'project_detail' project.pk %}">{{ project.name }}</a></td>
             <td>{{ project.target_count }}</td>
             <td>{{ project.description }}</td>
-            <td>{{ project.stack }}</td>
+            <td>{{ project.stack|join:', ' }}</td>
             <td>{{ project.created_at|date:'Y-m-d' }}</td>
           </tr>
         {% endfor %}
