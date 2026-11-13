@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
 
-from .models import Project
+from .models import Project, Target
 
 STACK_MAX_ITEMS = 20
 STACK_ITEM_MAX_LENGTH = 50
@@ -49,3 +49,22 @@ class ProjectSerializer(serializers.ModelSerializer):
         if len(stack) > STACK_MAX_ITEMS:
             raise serializers.ValidationError(f'기술 스택은 {STACK_MAX_ITEMS}개까지 입력할 수 있습니다.')
         return stack
+
+
+class TargetSerializer(serializers.ModelSerializer):
+    # 저장된 값('api', 'prod')과 함께 화면에 보여 줄 이름('API', '운영')도 보낸다.
+    kind_label = serializers.CharField(source='get_kind_display', read_only=True)
+    environment_label = serializers.CharField(source='get_environment_display', read_only=True)
+
+    class Meta:
+        model = Target
+        fields = ['id', 'name', 'kind', 'kind_label', 'environment', 'environment_label', 'config', 'created_at']
+
+
+class ProjectDetailSerializer(serializers.ModelSerializer):
+    # 프로젝트에 속한 대상 목록. 모델의 related_name='targets'로 가져온다.
+    targets = TargetSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Project
+        fields = ['id', 'name', 'description', 'stack', 'targets', 'created_at']

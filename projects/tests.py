@@ -371,3 +371,65 @@ class ProjectCreateApiTests(TestCase):
 
         self.assertEqual(response.status_code, 403)
         self.assertFalse(Project.objects.exists())
+
+
+class ProjectDetailApiTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user('tester', password='correct-horse-battery')
+        self.client.force_login(self.user)
+        self.project = Project.objects.create(name='investfeed', description='금융', stack=['Spring Boot'])
+
+    def get(self, pk):
+        return self.client.get(reverse('api_project_detail', args=[pk]))
+
+    def test_프로젝트와_대상_목록을_돌려준다(self):
+        Target.objects.create(
+            project=self.project, name='운영 API', kind='api', environment='prod',
+            config={'base_url': 'https://api.example.com', 'token_location': 'header'},
+        )
+
+        response = self.get(self.project.pk)
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data['id'], self.project.pk)
+        self.assertEqual(data['name'], 'investfeed')
+        self.assertEqual(data['description'], '금융')
+        self.assertEqual(data['stack'], ['Spring Boot'])
+        self.assertIn('created_at', data)
+        target = data['targets'][0]
+        self.assertEqual(target['name'], '운영 API')
+        self.assertEqual(target['kind'], 'api')
+        self.assertEqual(target['kind_label'], 'API')
+        self.assertEqual(target['environment'], 'prod')
+        self.assertEqual(target['environment_label'], '운영')
+        self.assertEqual(target['config'], {'base_url': 'https://api.example.com', 'token_location': 'header'})
+
+    def test_대상은_먼저_등록한_것부터_돌려준다(self):
+        Target.objects.create(project=self.project, name='먼저', kind='repo', environment='local')
+        Target.objects.create(project=self.project, name='나중', kind='domain', environment='prod')
+
+        response = self.get(self.project.pk)
+
+        self.assertEqual([target['name'] for target in response.json()['targets']], ['먼저', '나중'])
+
+    def test_다른_프로젝트의_대상은_넣지_않는다(self):
+        other = Project.objects.create(name='karaoke')
+        Target.objects.create(project=other, name='다른 대상', kind='repo', environment='local')
+
+        response = self.get(self.project.pk)
+
+        self.assertEqual(response.json()['targets'], [])
+
+    def test_없는_프로젝트는_404다(self):
+        response = self.get(self.project.pk + 1)
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_로그인하지_않으면_403이고_데이터를_주지_않는다(self):
+        self.client.logout()
+
+        response = self.get(self.project.pk)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertNotContains(response, 'investfeed', status_code=403)
