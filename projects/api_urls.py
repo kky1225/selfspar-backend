@@ -12,4 +12,9 @@ urlpatterns = [
         login_not_required(api_views.ProjectDetailApi.as_view()),
         name='api_project_detail',
     ),
+    path(
+        'projects/<int:project_pk>/targets/',
+        login_not_required(api_views.TargetCreateApi.as_view()),
+        name='api_target_create',
+    ),
 ]

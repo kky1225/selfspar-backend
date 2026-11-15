@@ -433,3 +433,181 @@ class ProjectDetailApiTests(TestCase):
 
         self.assertEqual(response.status_code, 403)
         self.assertNotContains(response, 'investfeed', status_code=403)
+
+
+class TargetCreateApiTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user('tester', password='correct-horse-battery')
+        self.client.force_login(self.user)
+        self.project = Project.objects.create(name='investfeed')
+        self.url = reverse('api_target_create', args=[self.project.pk])
+
+    def create(self, kind, config, client=None, url=None, **data):
+        body = {'name': '대상', 'kind': kind, 'environment': 'prod', 'config': config, **data}
+        return (client or self.client).post(url or self.url, body, content_type='application/json')
+
+    def test_저장소를_등록하면_201이고_대상을_돌려준다(self):
+        response = self.create('repo', {'path': '/Users/me/investfeed'})
+
+        self.assertEqual(response.status_code, 201)
+        target = Target.objects.get()
+        self.assertEqual(target.project, self.project)
+        self.assertEqual(target.kind, 'repo')
+        self.assertEqual(target.environment, 'prod')
+        self.assertEqual(target.config, {'path': '/Users/me/investfeed'})
+        data = response.json()
+        self.assertEqual(data['id'], target.pk)
+        self.assertEqual(data['kind_label'], '저장소')
+        self.assertEqual(data['environment_label'], '운영')
+        self.assertEqual(data['config'], {'path': '/Users/me/investfeed'})
+
+    def test_API는_비운_선택_칸을_config에_넣지_않는다(self):
+        self.create('api', {
+            'base_url': 'https://api.example.com',
+            'swagger_url': '',
+            'login_path': '',
+            'token_location': 'header',
+        })
+
+        self.assertEqual(
+            Target.objects.get().config,
+            {'base_url': 'https://api.example.com', 'token_location': 'header'},
+        )
+
+    def test_API의_모든_칸을_저장한다(self):
+        config = {
+            'base_url': 'http://localhost:8081',
+            'swagger_url': 'http://localhost:8081/v3/api-docs',
+            'login_path': '/api/auth/login',
+            'token_location': 'cookie',
+        }
+
+        self.create('api', config)
+
+        self.assertEqual(Target.objects.get().config, config)
+
+    def test_종류에_없는_칸은_저장하지_않는다(self):
+        self.create('repo', {'path': '/Users/me/investfeed', 'password': 'secret'})
+
+        self.assertEqual(Target.objects.get().config, {'path': '/Users/me/investfeed'})
+
+    def test_localhost_주소도_등록된다(self):
+        self.create('domain', {'url': 'http://localhost:8080'})
+
+        self.assertEqual(Target.objects.get().config, {'url': 'http://localhost:8080'})
+
+    def test_APK와_클라우드_계정을_등록한다(self):
+        self.create('apk', {'path': '/Users/me/app.apk'}, name='앱')
+        self.create('cloud', {'account_id': '123456789012', 'region': 'ap-northeast-2'}, name='AWS')
+
+        self.assertEqual(Target.objects.get(name='앱').config, {'path': '/Users/me/app.apk'})
+        self.assertEqual(
+            Target.objects.get(name='AWS').config,
+            {'account_id': '123456789012', 'region': 'ap-northeast-2'},
+        )
+
+    def test_잘못된_정보는_칸별_오류와_함께_400이다(self):
+        cases = [
+            ('repo', {'path': 'relative/path'}, 'path'),
+            ('repo', {'path': '/Users/me/../secret'}, 'path'),
+            ('repo', {}, 'path'),
+            ('domain', {'url': 'ftp://example.com'}, 'url'),
+            ('domain', {'url': 'example.com'}, 'url'),
+            ('domain', {'url': 'https://user:pass@example.com'}, 'url'),
+            ('api', {'base_url': 'https://a.com', 'token_location': 'header', 'login_path': 'login'}, 'login_path'),
+            ('api', {'base_url': 'https://a.com', 'token_location': 'body'}, 'token_location'),
+            ('apk', {'path': '/Users/me/app.zip'}, 'path'),
+            ('cloud', {'account_id': '123', 'region': 'ap-northeast-2'}, 'account_id'),
+            ('cloud', {'account_id': '123456789012', 'region': 'seoul'}, 'region'),
+        ]
+        for kind, config, field in cases:
+            with self.subTest(kind=kind, config=config):
+                response = self.create(kind, config)
+
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(field, response.json()['config'])
+                self.assertFalse(Target.objects.exists())
+
+    def test_정보가_객체가_아니면_400이다(self):
+        response = self.create('repo', ['/Users/me/investfeed'])
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('config', response.json())
+        self.assertFalse(Target.objects.exists())
+
+    def test_종류와_환경은_정해진_값만_받는다(self):
+        cases = [
+            ('unknown', 'prod', 'kind'),
+            ('repo', 'unknown', 'environment'),
+        ]
+        for kind, environment, field in cases:
+            with self.subTest(kind=kind, environment=environment):
+                response = self.create(kind, {'path': '/Users/me/a'}, environment=environment)
+
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(field, response.json())
+                self.assertFalse(Target.objects.exists())
+
+    def test_이름이_비면_400이다(self):
+        response = self.create('repo', {'path': '/Users/me/a'}, name='  ')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['name'], ['이름을 입력하세요.'])
+
+    def test_같은_프로젝트에_같은_이름이면_400이고_정보_오류도_함께_준다(self):
+        Target.objects.create(project=self.project, name='대상', kind='repo', environment='local')
+
+        response = self.create('repo', {'path': 'relative'})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['name'], ['이 프로젝트에 같은 이름의 대상이 이미 있습니다.'])
+        self.assertIn('path', response.json()['config'])
+        self.assertEqual(Target.objects.count(), 1)
+
+    def test_다른_프로젝트에는_같은_이름을_쓸_수_있다(self):
+        other = Project.objects.create(name='karasearch')
+        Target.objects.create(project=other, name='대상', kind='repo', environment='local')
+
+        response = self.create('repo', {'path': '/Users/me/a'})
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Target.objects.filter(project=self.project).count(), 1)
+
+    def test_입력값으로_프로젝트를_바꿀_수_없다(self):
+        other = Project.objects.create(name='karasearch')
+
+        self.create('repo', {'path': '/Users/me/a'}, project=other.pk)
+
+        self.assertEqual(Target.objects.get().project, self.project)
+
+    def test_읽기_전용_칸은_보내도_무시된다(self):
+        self.create('repo', {'path': '/Users/me/a'}, id=999, kind_label='가짜', created_at='2000-01-01T00:00:00Z')
+
+        target = Target.objects.get()
+        self.assertNotEqual(target.pk, 999)
+        self.assertNotEqual(target.created_at.year, 2000)
+
+    def test_없는_프로젝트는_404다(self):
+        url = reverse('api_target_create', args=[self.project.pk + 1])
+
+        response = self.create('repo', {'path': '/Users/me/a'}, url=url)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(Target.objects.exists())
+
+    def test_로그인하지_않으면_403이고_저장되지_않는다(self):
+        self.client.logout()
+
+        response = self.create('repo', {'path': '/Users/me/a'})
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Target.objects.exists())
+
+    def test_CSRF_토큰_없이_보내면_403이고_저장되지_않는다(self):
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+
+        response = self.create('repo', {'path': '/Users/me/a'}, client=client)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Target.objects.exists())

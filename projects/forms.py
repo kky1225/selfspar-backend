@@ -1,29 +1,16 @@
-from urllib.parse import urlsplit
-
 from django import forms
 from django.core.exceptions import ValidationError
-from django.core.validators import RegexValidator, URLValidator
 
 from .models import Target
-
-
-def validate_web_url(value):
-    URLValidator(schemes=['http', 'https'])(value)
-    # https://아이디:비밀번호@주소 형태는 비밀번호가 DB에 그대로 저장되므로 막는다.
-    parts = urlsplit(value)
-    if parts.username or parts.password:
-        raise ValidationError('주소에 아이디나 비밀번호를 넣을 수 없습니다.')
-
-
-def validate_absolute_path(value):
-    if not value.startswith('/') or '..' in value.split('/'):
-        raise ValidationError('/로 시작하는 전체 경로를 입력하세요. ..는 쓸 수 없습니다.')
-
-
-def validate_apk_path(value):
-    validate_absolute_path(value)
-    if not value.endswith('.apk'):
-        raise ValidationError('.apk 파일 경로를 입력하세요.')
+from .validators import (
+    TOKEN_LOCATIONS,
+    validate_absolute_path,
+    validate_apk_path,
+    validate_aws_account_id,
+    validate_aws_region,
+    validate_url_path,
+    validate_web_url,
+)
 
 
 def web_url_field(label, **kwargs):
@@ -76,11 +63,11 @@ class ApiTargetForm(TargetForm):
         label='로그인 경로',
         max_length=200,
         required=False,
-        validators=[RegexValidator(r'^/', '/로 시작하는 경로를 입력하세요.')],
+        validators=[validate_url_path],
     )
     token_location = forms.ChoiceField(
         label='토큰 위치',
-        choices=[('header', 'Authorization 헤더'), ('cookie', '쿠키')],
+        choices=TOKEN_LOCATIONS,
     )
 
 
@@ -95,11 +82,11 @@ class CloudTargetForm(TargetForm):
 
     account_id = forms.CharField(
         label='AWS 계정 번호',
-        validators=[RegexValidator(r'^\d{12}$', '12자리 숫자를 입력하세요.')],
+        validators=[validate_aws_account_id],
     )
     region = forms.CharField(
         label='리전',
-        validators=[RegexValidator(r'^[a-z]{2}(-[a-z]+)+-\d+$', '예: ap-northeast-2')],
+        validators=[validate_aws_region],
     )
 
 

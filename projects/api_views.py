@@ -5,7 +5,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import Project
-from .serializers import ProjectDetailSerializer, ProjectSerializer
+from .serializers import ProjectDetailSerializer, ProjectSerializer, TargetSerializer
 
 
 class ProjectListCreateApi(APIView):
@@ -28,3 +28,13 @@ class ProjectDetailApi(APIView):
         project = get_object_or_404(Project, pk=pk)
         serializer = ProjectDetailSerializer(project)
         return Response(serializer.data)
+
+
+class TargetCreateApi(APIView):
+    def post(self, request, project_pk):
+        project = get_object_or_404(Project, pk=project_pk)
+        serializer = TargetSerializer(data=request.data, context={'project': project})
+        serializer.is_valid(raise_exception=True)
+        # 프로젝트는 입력값에 넣어 보내도 쓰지 않고, 주소의 프로젝트로 저장한다.
+        serializer.save(project=project)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
