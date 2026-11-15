@@ -1,8 +1,10 @@
+from cryptography.fernet import Fernet, InvalidToken
 from django.contrib.auth import get_user_model
-from django.test import Client, TestCase
+from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 
-from .models import Project, Target
+from . import crypto
+from .models import Project, Target, TestAccount
 
 
 class ProjectListApiTests(TestCase):
@@ -407,3 +409,175 @@ class TargetCreateApiTests(TestCase):
 
         self.assertEqual(response.status_code, 403)
         self.assertFalse(Target.objects.exists())
+
+
+class CryptoTests(TestCase):
+    def tearDown(self):
+        # 키를 바꾼 테스트가 다른 테스트에 영향을 주지 않게, 만들어 둔 암호화 객체를 버린다.
+        crypto._fernet.cache_clear()
+
+    def test_암호화한_값은_원래_값과_다르고_되돌릴_수_있다(self):
+        token = crypto.encrypt('p@ss word')
+
+        self.assertNotIn('p@ss word', token)
+        self.assertEqual(crypto.decrypt(token), 'p@ss word')
+
+    def test_다른_키로는_풀_수_없다(self):
+        token = crypto.encrypt('secret')
+        crypto._fernet.cache_clear()
+
+        with override_settings(SELFSPAR_ENCRYPTION_KEY=Fernet.generate_key().decode()):
+            with self.assertRaises(InvalidToken):
+                crypto.decrypt(token)
+
+
+class TestAccountApiTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user('tester', password='correct-horse-battery')
+        self.client.force_login(self.user)
+        self.project = Project.objects.create(name='investfeed')
+        self.target = Target.objects.create(project=self.project, name='운영 API', kind='api', environment='prod')
+        self.url = reverse('api_account_list', args=[self.target.pk])
+
+    def create(self, client=None, url=None, **data):
+        body = {'label': '사용자 A', 'username': 'test-a@example.com', 'password': 'pw-a-1234', **data}
+        return (client or self.client).post(url or self.url, body, content_type='application/json')
+
+    def make_account(self, target=None, label='사용자 A'):
+        account = TestAccount(target=target or self.target, label=label, username=f'{label}@example.com')
+        account.set_password('pw')
+        account.save()
+        return account
+
+    def test_계정을_추가하면_201이고_비밀번호는_응답에_없다(self):
+        response = self.create()
+
+        self.assertEqual(response.status_code, 201)
+        data = response.json()
+        self.assertEqual(data['label'], '사용자 A')
+        self.assertEqual(data['username'], 'test-a@example.com')
+        self.assertIn('created_at', data)
+        self.assertNotIn('password', data)
+        self.assertNotIn('pw-a-1234', response.content.decode())
+
+    def test_비밀번호는_암호화해서_저장한다(self):
+        self.create()
+
+        account = TestAccount.objects.get()
+        self.assertNotIn('pw-a-1234', account.password_encrypted)
+        self.assertEqual(account.get_password(), 'pw-a-1234')
+
+    def test_비밀번호_앞뒤_공백을_지우지_않는다(self):
+        self.create(password=' pw ')
+
+        self.assertEqual(TestAccount.objects.get().get_password(), ' pw ')
+
+    def test_목록은_먼저_등록한_계정부터_비밀번호_없이_돌려준다(self):
+        self.make_account(label='사용자 A')
+        self.make_account(label='사용자 B')
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item['label'] for item in response.json()], ['사용자 A', '사용자 B'])
+        self.assertNotIn('password', response.json()[0])
+        self.assertNotIn('password_encrypted', response.json()[0])
+
+    def test_다른_대상의_계정은_목록에_넣지_않는다(self):
+        other = Target.objects.create(project=self.project, name='다른 API', kind='api', environment='prod')
+        self.make_account(target=other)
+
+        self.assertEqual(self.client.get(self.url).json(), [])
+
+    def test_도메인에도_등록할_수_있다(self):
+        domain = Target.objects.create(project=self.project, name='웹', kind='domain', environment='prod')
+
+        response = self.create(url=reverse('api_account_list', args=[domain.pk]))
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_로그인이_없는_종류에는_등록할_수_없다(self):
+        for kind in ('repo', 'apk', 'cloud'):
+            with self.subTest(kind=kind):
+                target = Target.objects.create(project=self.project, name=kind, kind=kind, environment='local')
+
+                response = self.create(url=reverse('api_account_list', args=[target.pk]))
+
+                self.assertEqual(response.status_code, 400)
+                self.assertIn('detail', response.json())
+                self.assertFalse(TestAccount.objects.exists())
+
+    def test_빈_칸은_400이다(self):
+        for field in ('label', 'username', 'password'):
+            with self.subTest(field=field):
+                response = self.create(**{field: ''})
+
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(field, response.json())
+                self.assertFalse(TestAccount.objects.exists())
+
+    def test_같은_대상에_같은_이름이면_400이다(self):
+        self.make_account(label='사용자 A')
+
+        response = self.create(label='사용자 A')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['label'], ['이 대상에 같은 이름의 계정이 이미 있습니다.'])
+        self.assertEqual(TestAccount.objects.count(), 1)
+
+    def test_다른_대상에는_같은_이름을_쓸_수_있다(self):
+        other = Target.objects.create(project=self.project, name='다른 API', kind='api', environment='prod')
+        self.make_account(target=other, label='사용자 A')
+
+        self.assertEqual(self.create(label='사용자 A').status_code, 201)
+
+    def test_입력값으로_대상을_바꿀_수_없다(self):
+        other = Target.objects.create(project=self.project, name='다른 API', kind='api', environment='prod')
+
+        self.create(target=other.pk)
+
+        self.assertEqual(TestAccount.objects.get().target, self.target)
+
+    def test_삭제하면_204이고_지워진다(self):
+        account = self.make_account()
+
+        response = self.client.delete(reverse('api_account_detail', args=[account.pk]))
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(TestAccount.objects.exists())
+
+    def test_없는_대상과_없는_계정은_404다(self):
+        missing_target = reverse('api_account_list', args=[self.target.pk + 100])
+        missing_account = reverse('api_account_detail', args=[999])
+
+        self.assertEqual(self.client.get(missing_target).status_code, 404)
+        self.assertEqual(self.create(url=missing_target).status_code, 404)
+        self.assertEqual(self.client.delete(missing_account).status_code, 404)
+
+    def test_상세_API는_대상마다_계정_수를_돌려준다(self):
+        self.make_account(label='사용자 A')
+        self.make_account(label='사용자 B')
+        Target.objects.create(project=self.project, name='저장소', kind='repo', environment='local')
+
+        response = self.client.get(reverse('api_project_detail', args=[self.project.pk]))
+
+        counts = [(target['name'], target['account_count']) for target in response.json()['targets']]
+        self.assertEqual(counts, [('운영 API', 2), ('저장소', 0)])
+
+    def test_로그인하지_않으면_403이다(self):
+        account = self.make_account()
+        self.client.logout()
+
+        self.assertEqual(self.client.get(self.url).status_code, 403)
+        self.assertEqual(self.create(label='사용자 B').status_code, 403)
+        self.assertEqual(self.client.delete(reverse('api_account_detail', args=[account.pk])).status_code, 403)
+        self.assertEqual(TestAccount.objects.count(), 1)
+
+    def test_CSRF_토큰_없이는_추가하거나_지울_수_없다(self):
+        account = self.make_account()
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+
+        self.assertEqual(self.create(client=client, label='사용자 B').status_code, 403)
+        self.assertEqual(client.delete(reverse('api_account_detail', args=[account.pk])).status_code, 403)
+        self.assertEqual(TestAccount.objects.count(), 1)

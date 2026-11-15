@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
 
-from .models import Project, Target
+from .models import Project, Target, TestAccount
 from .validators import (
     TOKEN_LOCATIONS,
     validate_absolute_path,
@@ -102,12 +102,17 @@ class TargetSerializer(serializers.ModelSerializer):
     # 저장된 값('api', 'prod')과 함께 화면에 보여 줄 이름('API', '운영')도 보낸다.
     kind_label = serializers.CharField(source='get_kind_display', read_only=True)
     environment_label = serializers.CharField(source='get_environment_display', read_only=True)
+    # 조회할 때 세서 붙이는 값이다. 방금 등록한 대상처럼 세지 않은 객체는 0이다.
+    account_count = serializers.IntegerField(read_only=True, default=0)
     # 종류별 칸 검사는 종류를 알아야 해서 validate에서 한다.
     config = serializers.DictField(default=dict)
 
     class Meta:
         model = Target
-        fields = ['id', 'name', 'kind', 'kind_label', 'environment', 'environment_label', 'config', 'created_at']
+        fields = [
+            'id', 'name', 'kind', 'kind_label', 'environment', 'environment_label',
+            'config', 'account_count', 'created_at',
+        ]
         extra_kwargs = {
             'name': {'error_messages': {'required': '이름을 입력하세요.', 'blank': '이름을 입력하세요.'}},
         }
@@ -139,3 +144,34 @@ class ProjectDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = Project
         fields = ['id', 'name', 'description', 'stack', 'targets', 'created_at']
+
+
+class TestAccountSerializer(serializers.ModelSerializer):
+    # 받기만 하고 응답에는 넣지 않는다. 비밀번호는 앞뒤 공백도 그대로 둔다.
+    password = serializers.CharField(
+        write_only=True,
+        max_length=200,
+        trim_whitespace=False,
+        error_messages={'required': '비밀번호를 입력하세요.', 'blank': '비밀번호를 입력하세요.'},
+    )
+
+    class Meta:
+        model = TestAccount
+        fields = ['id', 'label', 'username', 'password', 'created_at']
+        extra_kwargs = {
+            'label': {'error_messages': {'required': '이름을 입력하세요.', 'blank': '이름을 입력하세요.'}},
+            'username': {'error_messages': {'required': '아이디를 입력하세요.', 'blank': '아이디를 입력하세요.'}},
+        }
+
+    def validate_label(self, value):
+        # 계정을 넣을 대상은 입력값이 아니라 주소에서 정해서 view가 넘겨준다.
+        if TestAccount.objects.filter(target=self.context['target'], label=value).exists():
+            raise serializers.ValidationError('이 대상에 같은 이름의 계정이 이미 있습니다.')
+        return value
+
+    def create(self, validated_data):
+        password = validated_data.pop('password')
+        account = TestAccount(**validated_data)
+        account.set_password(password)
+        account.save()
+        return account

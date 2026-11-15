@@ -14,6 +14,13 @@
    | `POSTGRES_DB` | DB 이름 (예: `selfspar`) |
    | `POSTGRES_USER` | DB 사용자 (예: `selfspar`) |
    | `POSTGRES_PASSWORD` | DB 비밀번호. 임의의 문자열 |
+   | `SELFSPAR_ENCRYPTION_KEY` | 테스트 계정 비밀번호 암호화 키. 잃어버리면 저장한 비밀번호를 풀 수 없다 |
+
+   암호화 키는 아래 명령으로 만든다.
+
+   ```bash
+   python3 -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
+   ```
 
 2. 컨테이너를 띄우고 DB 테이블을 만든다.
 

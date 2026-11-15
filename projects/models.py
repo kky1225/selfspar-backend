@@ -1,5 +1,7 @@
 from django.db import models
 
+from .crypto import decrypt, encrypt
+
 
 class Project(models.Model):
     """점검할 내 서비스 하나. 예: investfeed"""
@@ -34,6 +36,9 @@ class Target(models.Model):
         STAGING = 'staging', '스테이징'
         PROD = 'prod', '운영'
 
+    # 로그인 기능이 있어서 테스트 계정을 등록할 수 있는 종류
+    LOGIN_KINDS = (Kind.API, Kind.DOMAIN)
+
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='targets')
     name = models.CharField('이름', max_length=100)
     kind = models.CharField('종류', max_length=10, choices=Kind.choices)
@@ -51,3 +56,30 @@ class Target(models.Model):
 
     def __str__(self):
         return f'{self.project} / {self.name}'
+
+
+class TestAccount(models.Model):
+    """점검할 때 로그인에 쓰는 대상의 테스트 계정. 예: 관리자 API의 사용자 A"""
+
+    target = models.ForeignKey(Target, on_delete=models.CASCADE, related_name='accounts')
+    label = models.CharField('이름', max_length=50)
+    username = models.CharField('아이디', max_length=200)
+    # 원래 비밀번호는 저장하지 않는다. set_password / get_password로만 다룬다.
+    password_encrypted = models.TextField('암호화된 비밀번호')
+    created_at = models.DateTimeField('등록일', auto_now_add=True)
+
+    class Meta:
+        verbose_name = '테스트 계정'
+        ordering = ['created_at']
+        constraints = [
+            models.UniqueConstraint(fields=['target', 'label'], name='unique_account_label_per_target'),
+        ]
+
+    def __str__(self):
+        return f'{self.target} / {self.label}'
+
+    def set_password(self, raw_password):
+        self.password_encrypted = encrypt(raw_password)
+
+    def get_password(self):
+        return decrypt(self.password_encrypted)

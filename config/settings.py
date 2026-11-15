@@ -24,6 +24,9 @@ SECRET_KEY = os.environ['DJANGO_SECRET_KEY']
 # .env에 DJANGO_DEBUG=1이 있을 때만 켠다. 없으면 꺼진 상태가 기본이다.
 DEBUG = os.environ.get('DJANGO_DEBUG') == '1'
 
+# 테스트 계정 비밀번호를 암호화하는 키(Fernet). DB가 유출돼도 이 키가 없으면 비밀번호를 읽을 수 없다.
+SELFSPAR_ENCRYPTION_KEY = os.environ['SELFSPAR_ENCRYPTION_KEY']
+
 # selfspar는 내 컴퓨터에서만 쓰므로 이 두 주소로 들어온 요청만 받는다.
 ALLOWED_HOSTS = ['localhost', '127.0.0.1']
 

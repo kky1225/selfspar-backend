@@ -2,3 +2,5 @@ Django==6.1.2
 djangorestframework==3.18.3
 # PostgreSQL 연결 드라이버. [binary]는 컴파일 없이 바로 설치되는 버전이다.
 psycopg[binary]==3.3.6
+# 테스트 계정 비밀번호를 암호화해서 저장한다(Fernet).
+cryptography==50.0.2
