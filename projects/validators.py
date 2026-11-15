@@ -1,4 +1,4 @@
-"""대상 정보(config) 값 검사. 템플릿 폼과 API serializer가 함께 쓴다."""
+"""대상 정보(config) 값 검사. serializers.py의 종류별 Config serializer가 쓴다."""
 
 from urllib.parse import urlsplit
 

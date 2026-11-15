@@ -15,15 +15,11 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
-from django.contrib.auth import views as auth_views
 from django.urls import include, path
 
+# 화면은 React(selfspar-frontend)가 그리고, 여기에는 API와 관리자 화면만 둔다.
 urlpatterns = [
     path('admin/', admin.site.urls),
-    # 인증 처리는 직접 짜지 않고 Django 기본 뷰를 쓴다.
-    path('login/', auth_views.LoginView.as_view(), name='login'),
-    path('logout/', auth_views.LogoutView.as_view(), name='logout'),
     path('api/auth/', include('accounts.api_urls')),
     path('api/', include('projects.api_urls')),
-    path('', include('projects.urls')),
 ]

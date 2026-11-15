@@ -38,7 +38,7 @@ class Target(models.Model):
     name = models.CharField('이름', max_length=100)
     kind = models.CharField('종류', max_length=10, choices=Kind.choices)
     environment = models.CharField('환경', max_length=10, choices=Environment.choices)
-    # 종류마다 필요한 정보가 달라서 JSON 칸 하나에 담는다. 값 검사는 forms.py에서 한다.
+    # 종류마다 필요한 정보가 달라서 JSON 칸 하나에 담는다. 값 검사는 serializers.py에서 종류별로 한다.
     config = models.JSONField('종류별 정보', default=dict)
     created_at = models.DateTimeField('등록일', auto_now_add=True)
 

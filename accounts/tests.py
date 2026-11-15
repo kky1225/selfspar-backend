@@ -76,6 +76,15 @@ class AuthApiTests(TestCase):
         self.assertEqual(response.status_code, 204)
         self.assertEqual(self.me().status_code, 403)
 
+    def test_로그아웃은_GET_요청으로_되지_않는다(self):
+        # 링크나 이미지 주소만으로 로그아웃시키지 못하게, 상태를 바꾸는 요청은 POST만 받는다.
+        self.login()
+
+        response = self.client.get(reverse('api_logout'))
+
+        self.assertEqual(response.status_code, 405)
+        self.assertEqual(self.me().status_code, 200)
+
     def test_로그인하면_세션_ID가_바뀐다(self):
         session = self.client.session
         session['before_login'] = True

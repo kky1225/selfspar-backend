@@ -22,9 +22,10 @@
    docker compose exec web python manage.py migrate
    ```
 
-3. 브라우저에서 http://127.0.0.1:8800 에 접속한다.
+3. 화면은 프론트엔드 저장소(selfspar-frontend)를 실행해서 http://localhost:5180 으로 접속한다.
+   이 서버(`127.0.0.1:8800`)에는 API(`/api/`)와 관리자 화면(`/admin/`)만 있다.
 
 ## 구성
 
-- `web`: Django 6.1 (Python 3.13). 내 컴퓨터의 `127.0.0.1:8800`에만 열린다.
+- `web`: Django 6.1 + DRF (Python 3.13). 내 컴퓨터의 `127.0.0.1:8800`에만 열린다.
 - `db`: PostgreSQL 18. 외부로 열리지 않고 `web`에서만 접속한다.
