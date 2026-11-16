@@ -43,6 +43,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'accounts',
     'projects',
+    'scans',
 ]
 
 MIDDLEWARE = [
@@ -113,6 +114,18 @@ DATABASES = {
         'PORT': os.environ.get('POSTGRES_PORT', '5432'),
     }
 }
+
+
+# 점검 실행(Celery)
+# web이 점검 요청을 Redis에 넣으면 worker가 꺼내서 실행한다. 'redis'는 docker-compose.yml의 서비스 이름이다.
+CELERY_BROKER_URL = 'redis://redis:6379/0'
+# worker가 시작할 때 Redis가 아직 준비 안 됐으면 기다렸다가 다시 접속한다.
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+# 점검 결과는 DB(ScanTask)에 직접 적으므로 Celery의 결과 저장 기능은 쓰지 않는다.
+CELERY_TASK_IGNORE_RESULT = True
+
+# 점검 도구가 낸 원본 결과 파일을 두는 폴더. docker-compose.yml에서 볼륨으로 붙인다.
+SELFSPAR_SCAN_RESULTS_DIR = Path(os.environ.get('SELFSPAR_SCAN_RESULTS_DIR', '/data/scan-results'))
 
 
 # Password validation

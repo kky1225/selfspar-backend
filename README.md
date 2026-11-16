@@ -15,6 +15,7 @@
    | `POSTGRES_USER` | DB 사용자 (예: `selfspar`) |
    | `POSTGRES_PASSWORD` | DB 비밀번호. 임의의 문자열 |
    | `SELFSPAR_ENCRYPTION_KEY` | 테스트 계정 비밀번호 암호화 키. 잃어버리면 저장한 비밀번호를 풀 수 없다 |
+   | `SELFSPAR_REPO_ROOT` | 점검할 저장소들이 있는 내 컴퓨터 폴더 (예: `/Users/me/IdeaProjects`). worker에 읽기 전용으로 붙는다 |
 
    암호화 키는 아래 명령으로 만든다.
 
@@ -35,4 +36,12 @@
 ## 구성
 
 - `web`: Django 6.1 + DRF (Python 3.13). 내 컴퓨터의 `127.0.0.1:8800`에만 열린다.
-- `db`: PostgreSQL 18. 외부로 열리지 않고 `web`에서만 접속한다.
+- `worker`: 점검을 실제로 실행한다(Celery). 점검 도구(gitleaks)가 들어 있다. 코드를 고친 뒤에는 `docker compose restart worker`로 다시 띄운다.
+- `redis`: `web`이 점검 요청을 넣고 `worker`가 꺼내 가는 곳. 외부로 열리지 않는다.
+- `db`: PostgreSQL 18. 외부로 열리지 않고 `web`, `worker`에서만 접속한다.
+
+## 점검 모듈
+
+| 모듈 | 대상 | 도구 | 확인하는 것 |
+|---|---|---|---|
+| 시크릿 유출 | 저장소 | gitleaks 8.30.1 | 커밋 이력 전체에 남은 API 키, 비밀번호. 결과에는 찾은 값을 가려서(REDACTED) 남긴다 |

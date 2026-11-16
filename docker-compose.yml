@@ -15,6 +15,15 @@ services:
       retries: 10
     # ports가 없다: DB는 web 컨테이너에서만 접속할 수 있고 내 컴퓨터 밖으로 열리지 않는다.
 
+  # 점검 요청을 web에서 worker로 넘기는 우편함. web과 worker만 접속한다(ports 없음).
+  redis:
+    image: redis:8
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   web:
     build: .
     command: python manage.py runserver 0.0.0.0:8000
@@ -30,6 +39,28 @@ services:
       db:
         # DB가 접속을 받을 준비가 된 뒤에 web을 띄운다.
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # 점검을 실제로 실행하는 곳. web과 같은 이미지를 쓰고 실행 명령만 다르다.
+  # 코드를 고친 뒤에는 자동으로 다시 읽지 않으므로 docker compose restart worker가 필요하다.
+  worker:
+    build: .
+    command: celery -A config worker --loglevel=info --concurrency=2
+    env_file: .env
+    volumes:
+      - .:/app
+      # 점검할 저장소가 있는 내 컴퓨터 폴더. 컨테이너 안에서도 같은 경로로 붙여서 대상에 적은 경로를 그대로 쓴다.
+      # 읽기 전용(ro)이라 점검 도구가 코드를 바꿀 수 없다.
+      - ${SELFSPAR_REPO_ROOT:?.env에 SELFSPAR_REPO_ROOT를 적으세요}:${SELFSPAR_REPO_ROOT}:ro
+      # 도구가 낸 원본 결과 파일. 컨테이너를 다시 만들어도 남는다.
+      - scanresults:/data/scan-results
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 volumes:
   pgdata:
+  scanresults:

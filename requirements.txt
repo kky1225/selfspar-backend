@@ -4,3 +4,8 @@ djangorestframework==3.18.3
 psycopg[binary]==3.3.6
 # 테스트 계정 비밀번호를 암호화해서 저장한다(Fernet).
 cryptography==50.0.2
+# 오래 걸리는 점검을 web 요청과 따로, worker에서 실행한다.
+# kombu는 Celery가 메시지를 주고받는 부분이고, redis는 Redis 접속 드라이버다. 셋의 버전을 맞춰 고정한다.
+celery==5.6.3
+kombu==5.6.2
+redis==6.4.0
