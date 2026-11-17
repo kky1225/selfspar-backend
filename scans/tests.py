@@ -12,9 +12,9 @@ from django.urls import reverse
 
 from projects.models import Project, Target
 
-from .models import Scan, ScanTask
+from .models import ModuleRun, Scan
 from .modules import MODULES_BY_KEY
-from .modules.base import ModuleResult, ScanError, ScanModule
+from .modules.base import FindingData, ModuleResult, ScanError, ScanModule
 from .modules.secrets import SecretsModule
 from .tasks import run_scan
 
@@ -22,6 +22,13 @@ from .tasks import run_scan
 def make_target(project, name='로컬', kind='repo', path='/repo'):
     config = {'path': path} if kind == 'repo' else {'base_url': 'http://localhost:8081', 'token_location': 'header'}
     return Target.objects.create(project=project, name=name, kind=kind, environment='local', config=config)
+
+
+def finding_data(fingerprint, location='settings.py:1'):
+    return FindingData(
+        fingerprint=fingerprint, rule_id='generic-api-key', title='Generic API Key', severity='critical',
+        location=location, evidence='api_key = REDACTED', extra={'commit': 'abc123'},
+    )
 
 
 class ScanApiTestCase(TestCase):
@@ -49,7 +56,7 @@ class ScanCreateApiTests(ScanApiTestCase):
         scan = Scan.objects.get()
         self.assertEqual(scan.status, Scan.Status.QUEUED)
         # 저장소 대상 × 시크릿 모듈 한 칸만 생긴다. API 대상에는 아직 해당하는 모듈이 없다.
-        self.assertEqual(list(scan.tasks.values_list('target', 'module')), [(self.repo.pk, 'secrets')])
+        self.assertEqual(list(scan.runs.values_list('target', 'module')), [(self.repo.pk, 'secrets')])
         data = response.json()
         self.assertEqual(data['id'], scan.pk)
         self.assertEqual(data['status_label'], '대기')
@@ -101,7 +108,7 @@ class ScanCreateApiTests(ScanApiTestCase):
 
         self.assertEqual(response.status_code, 503)
         self.assertFalse(Scan.objects.exists())
-        self.assertFalse(ScanTask.objects.exists())
+        self.assertFalse(ModuleRun.objects.exists())
 
     def test_DB도_끝나지_않은_점검을_프로젝트마다_하나만_허용한다(self):
         Scan.objects.create(project=self.project, status=Scan.Status.RUNNING)
@@ -131,13 +138,15 @@ class ScanCreateApiTests(ScanApiTestCase):
 
 
 class ScanListApiTests(ScanApiTestCase):
-    def test_최근_점검부터_칸_상태별_개수와_함께_돌려준다(self):
+    def test_최근_점검부터_칸_상태별_개수와_발견_건수를_함께_돌려준다(self):
         old = Scan.objects.create(project=self.project, status=Scan.Status.DONE)
-        ScanTask.objects.create(scan=old, target=self.repo, module='secrets', status=ScanTask.Status.FOUND)
-        ScanTask.objects.create(scan=old, target=self.api, module='other', status=ScanTask.Status.FAILED)
+        ModuleRun.objects.create(
+            scan=old, target=self.repo, module='secrets', status=ModuleRun.Status.FOUND, finding_count=2,
+        )
+        ModuleRun.objects.create(scan=old, target=self.api, module='other', status=ModuleRun.Status.FAILED)
         new = Scan.objects.create(project=self.project)
-        ScanTask.objects.create(scan=new, target=self.repo, module='secrets', status=ScanTask.Status.PASSED)
-        ScanTask.objects.create(scan=new, target=self.api, module='other', status=ScanTask.Status.RUNNING)
+        ModuleRun.objects.create(scan=new, target=self.repo, module='secrets', status=ModuleRun.Status.PASSED)
+        ModuleRun.objects.create(scan=new, target=self.api, module='other', status=ModuleRun.Status.RUNNING)
 
         response = self.client.get(reverse('api_scan_list', args=[self.project.pk]))
 
@@ -145,14 +154,22 @@ class ScanListApiTests(ScanApiTestCase):
         first, second = response.json()
         self.assertEqual(first['id'], new.pk)
         self.assertEqual(
-            (first['task_count'], first['finished_task_count'], first['found_count'], first['failed_count']),
+            (first['run_count'], first['finished_run_count'], first['finding_count'], first['failed_count']),
             (2, 1, 0, 0),
         )
         self.assertEqual(second['id'], old.pk)
+        # 발견은 칸 수(1)가 아니라 건수(2)를 센다.
         self.assertEqual(
-            (second['task_count'], second['finished_task_count'], second['found_count'], second['failed_count']),
-            (2, 2, 1, 1),
+            (second['run_count'], second['finished_run_count'], second['finding_count'], second['failed_count']),
+            (2, 2, 2, 1),
         )
+
+    def test_칸이_없는_점검의_발견_건수는_0이다(self):
+        Scan.objects.create(project=self.project)
+
+        response = self.client.get(reverse('api_scan_list', args=[self.project.pk]))
+
+        self.assertEqual(response.json()[0]['finding_count'], 0)
 
     def test_다른_프로젝트의_점검은_보이지_않는다(self):
         other = Project.objects.create(name='investfeed')
@@ -166,9 +183,9 @@ class ScanListApiTests(ScanApiTestCase):
 class ScanDetailApiTests(ScanApiTestCase):
     def test_격자에_필요한_모듈_대상_칸을_돌려준다(self):
         scan = Scan.objects.create(project=self.project)
-        ScanTask.objects.create(
-            scan=scan, target=self.repo, module='secrets', status=ScanTask.Status.FOUND,
-            finding_count=2, tool_version='8.30.1', raw_output_path='scan-1/task-1-secrets.json',
+        ModuleRun.objects.create(
+            scan=scan, target=self.repo, module='secrets', status=ModuleRun.Status.FOUND,
+            finding_count=2, tool_version='8.30.1', raw_output_path='scan-1/run-1-secrets.json',
         )
 
         response = self.client.get(reverse('api_scan_detail', args=[scan.pk]))
@@ -178,12 +195,12 @@ class ScanDetailApiTests(ScanApiTestCase):
         self.assertEqual(data['project'], {'id': self.project.pk, 'name': 'karaoke'})
         self.assertEqual([target['name'] for target in data['targets']], ['로컬', '관리자'])
         self.assertEqual(data['targets'][0]['kind_label'], '저장소')
-        task = data['tasks'][0]
-        self.assertEqual(task['target'], self.repo.pk)
-        self.assertEqual(task['status_label'], '발견')
-        self.assertEqual(task['finding_count'], 2)
+        run = data['runs'][0]
+        self.assertEqual(run['target'], self.repo.pk)
+        self.assertEqual(run['status_label'], '발견')
+        self.assertEqual(run['finding_count'], 2)
         # 서버 안의 파일 경로는 화면에 보낼 필요가 없다.
-        self.assertNotIn('raw_output_path', task)
+        self.assertNotIn('raw_output_path', run)
 
     def test_점검을_시작한_뒤에_등록한_대상은_빼고_보낸다(self):
         scan = Scan.objects.create(project=self.project)
@@ -227,8 +244,8 @@ class RunScanTests(TestCase):
         self.addCleanup(settings_patch.disable)
 
         fakes = {
-            'found': FakeModule('found', ModuleResult(3, '1.0.0', b'[1, 2, 3]')),
-            'passed': FakeModule('passed', ModuleResult(0, '1.0.0', b'[]')),
+            'found': FakeModule('found', ModuleResult('1.0.0', b'[1, 2, 3]', [finding_data(f'fp-{n}') for n in range(3)])),
+            'passed': FakeModule('passed', ModuleResult('1.0.0', b'[]')),
             'scan_error': FakeModule('scan_error', error=ScanError('저장소 폴더를 찾을 수 없습니다')),
             'crash': FakeModule('crash', error=KeyError('path')),
         }
@@ -240,71 +257,71 @@ class RunScanTests(TestCase):
         self.target = make_target(project)
         self.scan = Scan.objects.create(project=project)
 
-    def task(self, module):
-        return ScanTask.objects.create(scan=self.scan, target=self.target, module=module)
+    def make_run(self, module):
+        return ModuleRun.objects.create(scan=self.scan, target=self.target, module=module)
 
     def test_찾으면_발견이고_원본_결과를_파일로_보관한다(self):
-        task = self.task('found')
+        run = self.make_run('found')
 
         run_scan(self.scan.pk)
 
-        task.refresh_from_db()
-        self.assertEqual(task.status, ScanTask.Status.FOUND)
-        self.assertEqual(task.finding_count, 3)
-        self.assertEqual(task.tool_version, '1.0.0')
-        self.assertIsNotNone(task.started_at)
-        self.assertIsNotNone(task.finished_at)
-        self.assertEqual(task.raw_output_path, f'scan-{self.scan.pk}/task-{task.pk}-found.json')
-        saved = Path(self.results_dir.name) / task.raw_output_path
+        run.refresh_from_db()
+        self.assertEqual(run.status, ModuleRun.Status.FOUND)
+        self.assertEqual(run.finding_count, 3)
+        self.assertEqual(run.tool_version, '1.0.0')
+        self.assertIsNotNone(run.started_at)
+        self.assertIsNotNone(run.finished_at)
+        self.assertEqual(run.raw_output_path, f'scan-{self.scan.pk}/run-{run.pk}-found.json')
+        saved = Path(self.results_dir.name) / run.raw_output_path
         self.assertEqual(saved.read_bytes(), b'[1, 2, 3]')
 
     def test_못_찾으면_이상_없음이다(self):
-        task = self.task('passed')
+        run = self.make_run('passed')
 
         run_scan(self.scan.pk)
 
-        task.refresh_from_db()
-        self.assertEqual(task.status, ScanTask.Status.PASSED)
-        self.assertEqual(task.finding_count, 0)
+        run.refresh_from_db()
+        self.assertEqual(run.status, ModuleRun.Status.PASSED)
+        self.assertEqual(run.finding_count, 0)
 
     def test_도구가_실패하면_실패이고_오류_내용을_남긴다(self):
-        task = self.task('scan_error')
+        run = self.make_run('scan_error')
 
         run_scan(self.scan.pk)
 
-        task.refresh_from_db()
-        self.assertEqual(task.status, ScanTask.Status.FAILED)
-        self.assertEqual(task.error_message, '저장소 폴더를 찾을 수 없습니다')
-        self.assertEqual(task.raw_output_path, '')
+        run.refresh_from_db()
+        self.assertEqual(run.status, ModuleRun.Status.FAILED)
+        self.assertEqual(run.error_message, '저장소 폴더를 찾을 수 없습니다')
+        self.assertEqual(run.raw_output_path, '')
 
     def test_예상하지_못한_오류도_실패로_남기고_자세한_내용은_로그에_쓴다(self):
-        task = self.task('crash')
+        run = self.make_run('crash')
 
         with self.assertLogs('scans.tasks', 'ERROR'):
             run_scan(self.scan.pk)
 
-        task.refresh_from_db()
-        self.assertEqual(task.status, ScanTask.Status.FAILED)
-        self.assertIn('worker 로그', task.error_message)
+        run.refresh_from_db()
+        self.assertEqual(run.status, ModuleRun.Status.FAILED)
+        self.assertIn('worker 로그', run.error_message)
 
     def test_한_칸이_실패해도_나머지_칸을_실행하고_점검을_끝낸다(self):
-        failed = self.task('scan_error')
-        found = self.task('found')
+        failed = self.make_run('scan_error')
+        found = self.make_run('found')
 
         run_scan(self.scan.pk)
 
         failed.refresh_from_db()
         found.refresh_from_db()
         self.scan.refresh_from_db()
-        self.assertEqual(failed.status, ScanTask.Status.FAILED)
-        self.assertEqual(found.status, ScanTask.Status.FOUND)
+        self.assertEqual(failed.status, ModuleRun.Status.FAILED)
+        self.assertEqual(found.status, ModuleRun.Status.FOUND)
         self.assertEqual(self.scan.status, Scan.Status.DONE)
         self.assertIsNotNone(self.scan.finished_at)
 
     def test_실행기_자체가_멈춰도_점검은_완료로_바꿔_다음_점검을_막지_않는다(self):
-        self.task('found')
+        self.make_run('found')
 
-        with patch('scans.tasks.run_task', side_effect=RuntimeError('버그')):
+        with patch('scans.tasks.run_module', side_effect=RuntimeError('버그')):
             with self.assertRaises(RuntimeError):
                 run_scan(self.scan.pk)
 
@@ -346,21 +363,57 @@ class SecretsModuleTests(TestCase):
 
         result = self.run_module()
 
-        self.assertEqual(result.finding_count, 1)
+        self.assertEqual(len(result.findings), 1)
         self.assertNotIn(token, result.raw_output.decode())
         self.assertIn('REDACTED', result.raw_output.decode())
         self.assertRegex(result.tool_version, r'\d+\.\d+\.\d+')
 
+    def test_찾은_결과를_발견으로_바꾸고_근거에는_값을_가린다(self):
+        token = fake_github_token()
+        self.commit({'settings.py': f'GITHUB_TOKEN = "{token}"\n'})
+
+        finding = self.run_module().findings[0]
+
+        self.assertEqual(finding.severity, 'critical')
+        self.assertEqual(finding.location, 'settings.py:1')
+        self.assertTrue(finding.fingerprint)
+        self.assertTrue(finding.rule_id)
+        self.assertIn('REDACTED', finding.evidence)
+        self.assertNotIn(token, finding.evidence)
+        self.assertNotIn(token, str(finding.extra))
+        self.assertEqual(set(finding.extra), {'commit', 'date'})
+
     def test_토큰이_없으면_0개다(self):
         self.commit({'README.md': '# 안녕하세요\n'})
 
-        self.assertEqual(self.run_module().finding_count, 0)
+        self.assertEqual(self.run_module().findings, [])
 
     def test_커밋하지_않은_파일은_보지_않는다(self):
         self.commit({'README.md': '# 안녕하세요\n'})
         (self.repo / '.env').write_text(f'GITHUB_TOKEN={fake_github_token()}\n')
 
-        self.assertEqual(self.run_module().finding_count, 0)
+        self.assertEqual(self.run_module().findings, [])
+
+    def test_값이_가려지지_않은_결과는_저장하지_않고_실패한다(self):
+        leak = {
+            'RuleID': 'github-pat', 'Description': 'GitHub token', 'File': 'settings.py', 'StartLine': 1,
+            'Match': 'GITHUB_TOKEN = "ghp_진짜값"', 'Secret': 'ghp_진짜값', 'Fingerprint': 'abc:settings.py:github-pat:1',
+        }
+
+        with self.assertRaisesMessage(ScanError, '가려지지 않은 값'):
+            self.module.to_finding(leak)
+
+    def test_긴_근거_줄은_앞부분만_남긴다(self):
+        leak = {
+            'RuleID': 'generic-api-key', 'File': 'a.min.js', 'StartLine': 1, 'Match': 'x' * 1000 + 'REDACTED',
+            'Secret': 'REDACTED', 'Fingerprint': 'abc:a.min.js:generic-api-key:1',
+        }
+
+        finding = self.module.to_finding(leak)
+
+        self.assertEqual(len(finding.evidence), SecretsModule.EVIDENCE_LIMIT)
+        # 설명이 없으면 규칙 이름을 제목으로 쓴다.
+        self.assertEqual(finding.title, 'generic-api-key')
 
     def test_폴더가_없으면_실패한다(self):
         with self.assertRaisesMessage(ScanError, '저장소 폴더를 찾을 수 없습니다'):

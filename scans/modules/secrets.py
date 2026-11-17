@@ -4,9 +4,10 @@ import os
 import tempfile
 from pathlib import Path
 
+from findings.models import Finding
 from projects.models import Target
 
-from .base import ModuleResult, ScanError, ScanModule, last_lines
+from .base import FindingData, ModuleResult, ScanError, ScanModule, last_lines
 
 
 class SecretsModule(ScanModule):
@@ -16,6 +17,8 @@ class SecretsModule(ScanModule):
 
     # gitleaks는 기본으로 '찾았음'과 '오류'를 둘 다 1로 끝낸다. 둘을 구분하려고 찾았을 때는 2로 끝내게 한다.
     LEAKS_FOUND = 2
+    # 근거 줄을 저장할 때 남기는 최대 글자 수
+    EVIDENCE_LIMIT = 300
 
     def run(self, target):
         path = target.config['path']
@@ -58,7 +61,25 @@ class SecretsModule(ScanModule):
             raise ScanError('gitleaks 결과 파일을 읽지 못했습니다.')
 
         return ModuleResult(
-            finding_count=len(leaks),
             tool_version=version.stdout.decode().strip(),
             raw_output=raw_output,
+            findings=[self.to_finding(leak) for leak in leaks],
+        )
+
+    def to_finding(self, leak):
+        """gitleaks 결과 한 건을 발견 하나로 바꾼다."""
+        # --redact를 붙였으면 찾은 값은 REDACTED로 바뀌어 있다. 아니라면 진짜 값이 DB에 들어가므로 저장하지 않는다.
+        if leak.get('Secret') != 'REDACTED':
+            raise ScanError('gitleaks 결과에 가려지지 않은 값이 있어 저장하지 않았습니다.')
+        return FindingData(
+            fingerprint=leak['Fingerprint'],
+            rule_id=leak['RuleID'],
+            title=leak.get('Description') or leak['RuleID'],
+            # 시크릿 유출은 판정 기준에 따라 모두 치명으로 본다.
+            severity=Finding.Severity.CRITICAL,
+            location=f"{leak['File']}:{leak['StartLine']}",
+            # 찾은 값이 있던 줄. 값 자리는 REDACTED로 가려져 있다. 너무 긴 줄은 앞부분만 남긴다.
+            evidence=leak.get('Match', '')[:self.EVIDENCE_LIMIT],
+            # 커밋 작성자, 이메일, 커밋 메시지는 화면에 필요 없어서 저장하지 않는다(원본 파일에는 남는다).
+            extra={'commit': leak.get('Commit', ''), 'date': leak.get('Date', '')},
         )

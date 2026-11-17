@@ -2,7 +2,7 @@ from rest_framework import serializers
 
 from projects.models import Target
 
-from .models import Scan, ScanTask
+from .models import ModuleRun, Scan
 from .modules import MODULES
 
 
@@ -10,16 +10,17 @@ class ScanSummarySerializer(serializers.ModelSerializer):
     """프로젝트 상세의 최근 점검 목록 한 줄. 개수는 view에서 세어 붙인다."""
 
     status_label = serializers.CharField(source='get_status_display', read_only=True)
-    task_count = serializers.IntegerField(read_only=True, default=0)
-    finished_task_count = serializers.IntegerField(read_only=True, default=0)
-    found_count = serializers.IntegerField(read_only=True, default=0)
+    run_count = serializers.IntegerField(read_only=True, default=0)
+    finished_run_count = serializers.IntegerField(read_only=True, default=0)
+    # 발견 건수 합계. 칸 수가 아니다.
+    finding_count = serializers.IntegerField(read_only=True, default=0)
     failed_count = serializers.IntegerField(read_only=True, default=0)
 
     class Meta:
         model = Scan
         fields = [
             'id', 'status', 'status_label', 'created_at', 'finished_at',
-            'task_count', 'finished_task_count', 'found_count', 'failed_count',
+            'run_count', 'finished_run_count', 'finding_count', 'failed_count',
         ]
 
 
@@ -34,11 +35,11 @@ class ScanTargetSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'kind', 'kind_label', 'environment', 'environment_label']
 
 
-class ScanTaskSerializer(serializers.ModelSerializer):
+class ModuleRunSerializer(serializers.ModelSerializer):
     status_label = serializers.CharField(source='get_status_display', read_only=True)
 
     class Meta:
-        model = ScanTask
+        model = ModuleRun
         # 원본 결과 파일 경로는 서버 안의 경로라서 보내지 않는다.
         fields = [
             'id', 'target', 'module', 'status', 'status_label', 'finding_count',
@@ -47,17 +48,17 @@ class ScanTaskSerializer(serializers.ModelSerializer):
 
 
 class ScanDetailSerializer(serializers.ModelSerializer):
-    """점검 결과 화면. 격자를 그리는 데 필요한 열(모듈), 행(대상), 칸(task)을 함께 보낸다."""
+    """점검 결과 화면. 격자를 그리는 데 필요한 열(모듈), 행(대상), 칸(모듈 실행)을 함께 보낸다."""
 
     status_label = serializers.CharField(source='get_status_display', read_only=True)
     project = serializers.SerializerMethodField()
     modules = serializers.SerializerMethodField()
     targets = serializers.SerializerMethodField()
-    tasks = ScanTaskSerializer(many=True, read_only=True)
+    runs = ModuleRunSerializer(many=True, read_only=True)
 
     class Meta:
         model = Scan
-        fields = ['id', 'project', 'status', 'status_label', 'created_at', 'finished_at', 'modules', 'targets', 'tasks']
+        fields = ['id', 'project', 'status', 'status_label', 'created_at', 'finished_at', 'modules', 'targets', 'runs']
 
     def get_project(self, scan):
         return {'id': scan.project.id, 'name': scan.project.name}

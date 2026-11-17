@@ -36,8 +36,9 @@ class Scan(models.Model):
         return f'{self.project} / 점검 #{self.pk}'
 
 
-class ScanTask(models.Model):
-    """점검 결과 격자의 칸 하나. 대상 하나에 모듈 하나를 실행한 결과다."""
+class ModuleRun(models.Model):
+    """모듈 실행 기록 1건(이력). 점검 1회 안에서 대상 하나에 모듈 하나를 실행한 결과다.
+    점검할 때마다 새로 쌓이고, 결과 화면 격자의 칸 하나가 이것 하나다."""
 
     class Status(models.TextChoices):
         QUEUED = 'queued', '대기'
@@ -46,8 +47,8 @@ class ScanTask(models.Model):
         FOUND = 'found', '발견'
         FAILED = 'failed', '실패'
 
-    scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='tasks')
-    target = models.ForeignKey(Target, on_delete=models.CASCADE, related_name='scan_tasks')
+    scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='runs')
+    target = models.ForeignKey(Target, on_delete=models.CASCADE, related_name='module_runs')
     # 모듈 목록은 DB가 아니라 코드(scans/modules)에 있다. 여기에는 모듈의 key를 적는다. 예: 'secrets'
     module = models.CharField('모듈', max_length=30)
     status = models.CharField('상태', max_length=10, choices=Status.choices, default=Status.QUEUED)
@@ -61,10 +62,10 @@ class ScanTask(models.Model):
     finished_at = models.DateTimeField('종료일', null=True, blank=True)
 
     class Meta:
-        verbose_name = '점검 칸'
+        verbose_name = '모듈 실행'
         ordering = ['id']
         constraints = [
-            models.UniqueConstraint(fields=['scan', 'target', 'module'], name='unique_task_per_scan'),
+            models.UniqueConstraint(fields=['scan', 'target', 'module'], name='unique_run_per_scan'),
         ]
 
     def __str__(self):

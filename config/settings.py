@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     'accounts',
     'projects',
     'scans',
+    'findings',
 ]
 
 MIDDLEWARE = [
@@ -121,7 +122,7 @@ DATABASES = {
 CELERY_BROKER_URL = 'redis://redis:6379/0'
 # worker가 시작할 때 Redis가 아직 준비 안 됐으면 기다렸다가 다시 접속한다.
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
-# 점검 결과는 DB(ScanTask)에 직접 적으므로 Celery의 결과 저장 기능은 쓰지 않는다.
+# 점검 결과는 DB(ModuleRun)에 직접 적으므로 Celery의 결과 저장 기능은 쓰지 않는다.
 CELERY_TASK_IGNORE_RESULT = True
 
 # 점검 도구가 낸 원본 결과 파일을 두는 폴더. docker-compose.yml에서 볼륨으로 붙인다.
