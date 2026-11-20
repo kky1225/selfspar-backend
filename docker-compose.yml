@@ -25,7 +25,14 @@ services:
       retries: 10
 
   web:
-    build: .
+    build:
+      context: .
+      # Dockerfile의 web 단계까지만 만든다. git·점검 도구가 없는 이미지다.
+      target: web
+      args:
+        # 로컬 개발이라 개발용 의존성(dev 그룹)도 설치한다.
+        UV_NO_DEV: "false"
+    # runserver는 코드가 바뀌면 스스로 다시 읽는다.
     command: python manage.py runserver 0.0.0.0:8000
     env_file: .env
     volumes:
@@ -42,11 +49,16 @@ services:
       redis:
         condition: service_healthy
 
-  # 점검을 실제로 실행하는 곳. web과 같은 이미지를 쓰고 실행 명령만 다르다.
-  # 코드를 고친 뒤에는 자동으로 다시 읽지 않으므로 docker compose restart worker가 필요하다.
+  # 점검을 실제로 실행하는 곳. git과 점검 도구가 들어 있는 worker 단계 이미지를 쓴다.
   worker:
-    build: .
-    command: celery -A config worker --loglevel=info --concurrency=2
+    build:
+      context: .
+      target: worker
+      args:
+        UV_NO_DEV: "false"
+    # Celery는 스스로 코드를 다시 읽지 않아서, watchfiles가 .py 파일 변경을 감지하면 worker를 다시 띄운다(cookiecutter-django와 같은 방식).
+    # 다시 띄울 때 실행 중이던 점검은 중단된다. 로컬 개발용이다.
+    command: ["watchfiles", "--filter", "python", "celery.__main__.main", "--args", "-A config worker --loglevel=info --concurrency=2"]
     env_file: .env
     volumes:
       - .:/app
