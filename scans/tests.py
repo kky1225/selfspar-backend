@@ -1,6 +1,9 @@
+import json
+import os
 import secrets
 import string
 import subprocess
+import unittest
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +18,7 @@ from projects.models import Project, Target
 from .models import ModuleRun, Scan
 from .modules import MODULES_BY_KEY
 from .modules.base import FindingData, ModuleResult, ScanError, ScanModule
+from .modules.dependencies import DependenciesModule
 from .modules.secrets import SecretsModule
 from .tasks import run_scan
 
@@ -55,12 +59,18 @@ class ScanCreateApiTests(ScanApiTestCase):
         self.assertEqual(response.status_code, 201)
         scan = Scan.objects.get()
         self.assertEqual(scan.status, Scan.Status.QUEUED)
-        # 저장소 대상 × 시크릿 모듈 한 칸만 생긴다. API 대상에는 아직 해당하는 모듈이 없다.
-        self.assertEqual(list(scan.runs.values_list('target', 'module')), [(self.repo.pk, 'secrets')])
+        # 저장소 대상 × (시크릿, 의존성) 두 칸만 생긴다. API 대상에는 아직 해당하는 모듈이 없다.
+        self.assertEqual(
+            list(scan.runs.values_list('target', 'module')),
+            [(self.repo.pk, 'secrets'), (self.repo.pk, 'dependencies')],
+        )
         data = response.json()
         self.assertEqual(data['id'], scan.pk)
         self.assertEqual(data['status_label'], '대기')
-        self.assertEqual(data['modules'], [{'key': 'secrets', 'label': '시크릿 유출'}])
+        self.assertEqual(
+            data['modules'],
+            [{'key': 'secrets', 'label': '시크릿 유출'}, {'key': 'dependencies', 'label': '의존성 취약점'}],
+        )
 
     def test_만든_점검을_worker에_보낸다(self):
         self.start()
@@ -429,3 +439,197 @@ class SecretsModuleTests(TestCase):
         for kind in ['domain', 'api', 'apk', 'cloud']:
             with self.subTest(kind=kind):
                 self.assertFalse(self.module.applies_to(Target(kind=kind)))
+
+
+# 실제 trivy(0.76.2)가 lodash 4.17.20 하나만 든 package-lock.json에서 낸 결과. 설명·참고 링크 같은 긴 칸만 덜어 냈다.
+TRIVY_NPM_REPORT = (Path(__file__).parent / 'testdata' / 'trivy-npm.json').read_bytes()
+TRIVY_VERSION_OUTPUT = json.dumps({
+    'Version': '0.76.2',
+    'VulnerabilityDB': {'Version': 2, 'UpdatedAt': '2026-11-20T07:09:47.681202359Z'},
+}).encode()
+
+
+class DependenciesModuleTests(TestCase):
+    """trivy 실행은 가짜로 바꾸고, 실제 trivy가 낸 결과 파일을 넘겨서 해석·검사만 확인한다.
+    실제 trivy 실행은 맨 아래 DependenciesModuleIntegrationTests에서 따로 한다."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name)
+        # 결과 파일(fixture)과 맞춰 저장소에 잠금 파일 하나를 둔다. 잠금 파일이 없으면 trivy 전에 실패한다.
+        (self.repo / 'package-lock.json').write_text('{}')
+        self.module = DependenciesModule()
+        self.report = TRIVY_NPM_REPORT
+        self.commands = []
+
+    def fake_run_command(self, args):
+        """trivy fs는 --output 자리에 결과 파일을 쓰고, trivy version은 버전 JSON을 출력한 것처럼 꾸민다."""
+        self.commands.append(args)
+        if args[1] == 'fs':
+            Path(args[args.index('--output') + 1]).write_bytes(self.report)
+            return subprocess.CompletedProcess(args, 0, b'', b'')
+        return subprocess.CompletedProcess(args, 0, TRIVY_VERSION_OUTPUT, b'')
+
+    def run_module(self):
+        with patch.object(self.module, 'run_command', side_effect=self.fake_run_command):
+            return self.module.run(Target(kind='repo', config={'path': str(self.repo)}))
+
+    def test_취약점마다_발견_하나로_바꾼다(self):
+        result = self.run_module()
+
+        self.assertEqual([f.rule_id for f in result.findings], ['CVE-2021-23337', 'CVE-2026-4800', 'CVE-2020-28500', 'CVE-2025-13465'])
+        finding = result.findings[0]
+        self.assertEqual(finding.fingerprint, 'package-lock.json:lodash:4.17.20:CVE-2021-23337')
+        self.assertEqual(finding.title, 'nodejs-lodash: command injection via template')
+        self.assertEqual(finding.severity, 'high')
+        self.assertEqual(finding.location, 'package-lock.json')
+        self.assertEqual(finding.evidence, 'lodash 4.17.20 → 4.17.21에서 고침')
+        self.assertEqual(finding.extra, {
+            'package': 'lodash', 'installed_version': '4.17.20', 'fixed_version': '4.17.21',
+            'url': 'https://avd.aquasec.com/nvd/cve-2021-23337',
+        })
+        self.assertEqual(result.findings[2].severity, 'medium')
+
+    def test_원본_결과와_도구_버전_DB_날짜를_남긴다(self):
+        result = self.run_module()
+
+        self.assertEqual(result.raw_output, TRIVY_NPM_REPORT)
+        self.assertEqual(result.tool_version, '0.76.2 (DB 2026-11-20)')
+
+    def test_취약점만_보고_사용_통계와_버전_확인_접속을_끈다(self):
+        self.run_module()
+
+        fs = self.commands[0]
+        self.assertEqual(fs[:3], ['trivy', 'fs', str(self.repo)])
+        self.assertEqual(fs[fs.index('--scanners') + 1], 'vuln')
+        self.assertEqual(fs[fs.index('--cache-dir') + 1], '/data/trivy-cache')
+        self.assertIn('--disable-telemetry', fs)
+        self.assertIn('--skip-version-check', fs)
+
+    def test_취약점이_없는_잠금_파일은_0개다(self):
+        self.report = json.dumps({'Results': [{'Target': 'package-lock.json', 'Class': 'lang-pkgs'}]}).encode()
+
+        self.assertEqual(self.run_module().findings, [])
+
+    def test_의존성이_없는_잠금_파일은_trivy_결과가_비어도_0개다(self):
+        # 실제 trivy는 패키지가 하나도 없는 잠금 파일을 결과에서 뺀다(0.76.2에서 확인).
+        self.report = json.dumps({'SchemaVersion': 2, 'ArtifactType': 'filesystem'}).encode()
+
+        self.assertEqual(self.run_module().findings, [])
+
+    def test_잠금_파일이_하나도_없으면_trivy를_돌리지_않고_실패한다(self):
+        # 점검할 것이 없었던 것이지 안전한 것이 아니다.
+        (self.repo / 'package-lock.json').unlink()
+        (self.repo / 'README.md').write_text('# 안녕하세요\n')
+
+        with self.assertRaisesMessage(ScanError, '의존성 잠금 파일'):
+            self.run_module()
+        self.assertEqual(self.commands, [])
+
+    def test_gradle_lockfile이_없는_Gradle_프로젝트가_있으면_trivy를_돌리지_않고_실패한다(self):
+        (self.repo / 'build.gradle.kts').write_text('plugins { java }\n')
+        (self.repo / 'api').mkdir()
+        (self.repo / 'api' / 'build.gradle.kts').write_text('plugins { java }\n')
+
+        with self.assertRaisesMessage(ScanError, '잠금 파일이 없어 의존성을 확인할 수 없는 프로젝트가 있습니다') as error:
+            self.run_module()
+
+        self.assertIn('. (build.gradle.kts), api (build.gradle.kts)', str(error.exception))
+        self.assertEqual(self.commands, [])
+
+    def test_잠금_파일이_없는_npm_Python_프로젝트도_실패한다(self):
+        # 루트에 잠금 파일이 있으면 아래 폴더까지 인정되므로, 잠금 파일을 옆 폴더로 옮긴다.
+        (self.repo / 'other').mkdir()
+        (self.repo / 'package-lock.json').rename(self.repo / 'other' / 'package-lock.json')
+        (self.repo / 'web').mkdir()
+        (self.repo / 'web' / 'package.json').write_text(json.dumps({'dependencies': {'react': '^19.0.0'}}))
+        (self.repo / 'ai').mkdir()
+        (self.repo / 'ai' / 'pyproject.toml').write_text('[project]\nname = "ai"\ndependencies = ["fastapi"]\n')
+
+        with self.assertRaisesMessage(ScanError, 'ai (pyproject.toml), web (package.json)'):
+            self.run_module()
+
+    def test_의존성이_없는_목록_파일과_상위_폴더의_잠금_파일은_괜찮다(self):
+        # 스크립트만 있는 package.json, 도구 설정만 있는 pyproject.toml은 잠금 파일이 필요 없다.
+        (self.repo / 'tools').mkdir()
+        (self.repo / 'tools' / 'package.json').write_text(json.dumps({'scripts': {'lint': 'eslint .'}}))
+        (self.repo / 'tools' / 'pyproject.toml').write_text('[tool.ruff]\nline-length = 120\n')
+        # 모노레포는 잠금 파일이 맨 위(여기서는 저장소 루트의 package-lock.json)에 하나만 있다.
+        (self.repo / 'packages' / 'ui').mkdir(parents=True)
+        (self.repo / 'packages' / 'ui' / 'package.json').write_text(json.dumps({'dependencies': {'react': '^19.0.0'}}))
+
+        self.assertEqual(len(self.run_module().findings), 4)
+
+    def test_긴_경로는_칸_길이에_맞춰_줄인다(self):
+        finding = self.module.to_finding('a/' * 300 + 'package-lock.json', {
+            'VulnerabilityID': 'CVE-2021-23337', 'PkgName': 'lodash', 'InstalledVersion': '4.17.20',
+        })
+
+        self.assertRegex(finding.fingerprint, r'^sha256:[0-9a-f]{64}$')
+        self.assertEqual(len(finding.location), 500)
+
+    def test_gradle_lockfile이_있으면_점검한다(self):
+        (self.repo / 'build.gradle.kts').write_text('plugins { java }\n')
+        (self.repo / 'gradle.lockfile').write_text('empty=\n')
+
+        self.assertEqual(len(self.run_module().findings), 4)
+
+    def test_빌드_결과물_폴더의_Gradle_파일은_보지_않는다(self):
+        for skipped in ['node_modules/some-lib', 'build/tmp', 'buildSrc']:
+            (self.repo / skipped).mkdir(parents=True)
+            (self.repo / skipped / 'build.gradle').write_text('')
+
+        self.assertEqual(len(self.run_module().findings), 4)
+
+    def test_고친_버전이_없으면_근거에_그렇게_적는다(self):
+        finding = self.module.to_finding('uv.lock', {
+            'VulnerabilityID': 'CVE-2026-0001', 'PkgName': 'requests', 'InstalledVersion': '2.0.0', 'Severity': 'UNKNOWN',
+        })
+
+        self.assertEqual(finding.evidence, 'requests 2.0.0 (아직 고친 버전 없음)')
+        self.assertEqual(finding.extra['fixed_version'], '')
+        # 점수가 아직 없는 취약점은 '정보'로 둔다. 제목이 없으면 취약점 번호를 쓴다.
+        self.assertEqual(finding.severity, 'info')
+        self.assertEqual(finding.title, 'CVE-2026-0001')
+
+    def test_trivy가_실패하면_실패한다(self):
+        def failing(args):
+            return subprocess.CompletedProcess(args, 1, b'', b'FATAL failed to download vulnerability DB')
+
+        with patch.object(self.module, 'run_command', side_effect=failing):
+            with self.assertRaisesMessage(ScanError, 'failed to download vulnerability DB'):
+                self.module.run(Target(kind='repo', config={'path': str(self.repo)}))
+
+    def test_폴더가_없으면_실패한다(self):
+        with self.assertRaisesMessage(ScanError, '저장소 폴더를 찾을 수 없습니다'):
+            self.module.run(Target(kind='repo', config={'path': '/no/such/repo'}))
+
+    def test_저장소_대상에만_해당한다(self):
+        self.assertTrue(self.module.applies_to(Target(kind='repo')))
+        for kind in ['domain', 'api', 'apk', 'cloud']:
+            with self.subTest(kind=kind):
+                self.assertFalse(self.module.applies_to(Target(kind=kind)))
+
+
+@unittest.skipUnless(
+    os.environ.get('SELFSPAR_TRIVY_INTEGRATION') == '1',
+    '실제 trivy 실행은 취약점 DB를 내려받아야 해서 SELFSPAR_TRIVY_INTEGRATION=1일 때만 한다.',
+)
+class DependenciesModuleIntegrationTests(TestCase):
+    """worker에 설치한 trivy를 실제로 실행한다. 처음에는 취약점 DB(내려받기 약 135MB, 풀면 약 1.8GB)를 받는다."""
+
+    def test_취약한_lodash를_찾는다(self):
+        with tempfile.TemporaryDirectory() as repo:
+            (Path(repo) / 'package-lock.json').write_text(json.dumps({
+                'name': 'sample', 'version': '1.0.0', 'lockfileVersion': 3, 'requires': True,
+                'packages': {
+                    '': {'name': 'sample', 'version': '1.0.0', 'dependencies': {'lodash': '4.17.20'}},
+                    'node_modules/lodash': {'version': '4.17.20'},
+                },
+            }))
+
+            result = DependenciesModule().run(Target(kind='repo', config={'path': repo}))
+
+        self.assertIn('package-lock.json:lodash:4.17.20:CVE-2021-23337', [f.fingerprint for f in result.findings])
+        self.assertRegex(result.tool_version, r'^\d+\.\d+\.\d+ \(DB \d{4}-\d{2}-\d{2}\)$')

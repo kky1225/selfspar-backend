@@ -77,3 +77,22 @@ docker compose up -d --build
 | 모듈 | 대상 | 도구 | 확인하는 것 |
 |---|---|---|---|
 | 시크릿 유출 | 저장소 | gitleaks 8.30.1 | 커밋 이력 전체에 남은 API 키, 비밀번호. 결과에는 찾은 값을 가려서(REDACTED) 남긴다 |
+| 의존성 취약점 | 저장소 | trivy 0.76.2 | 잠금 파일(`package-lock.json`, `gradle.lockfile`, `uv.lock` 등)에 적힌 라이브러리 버전의 알려진 취약점(CVE). 잠금 파일이 없는 Gradle 프로젝트나 잠금 파일이 하나도 없는 저장소는 실패로 표시한다 |
+
+trivy는 내려받을 때 체크섬과 서명(cosign)을 모두 확인한다. 취약점 DB는 `trivycache` 볼륨에 두고, 하루가 지나면 점검할 때 새로 받는다.
+
+Gradle 프로젝트는 잠금 파일을 만들어야 점검할 수 있다. `build.gradle.kts`에 아래를 넣고 `./gradlew dependencies --write-locks`를 실행한다.
+
+```kotlin
+dependencyLocking {
+    lockAllConfigurations()
+}
+```
+
+멀티 모듈이면 루트의 `allprojects { }` 안에 넣는다.
+
+실제 trivy로 의존성 모듈을 확인하는 테스트는 취약점 DB를 내려받아야 해서 따로 실행한다.
+
+```bash
+docker compose exec -e SELFSPAR_TRIVY_INTEGRATION=1 worker python manage.py test scans.tests.DependenciesModuleIntegrationTests
+```

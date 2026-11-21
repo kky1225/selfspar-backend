@@ -127,6 +127,8 @@ CELERY_TASK_IGNORE_RESULT = True
 
 # 점검 도구가 낸 원본 결과 파일을 두는 폴더. docker-compose.yml에서 볼륨으로 붙인다.
 SELFSPAR_SCAN_RESULTS_DIR = Path(os.environ.get('SELFSPAR_SCAN_RESULTS_DIR', '/data/scan-results'))
+# trivy 취약점 DB를 두는 폴더. 점검마다 다시 내려받지 않게 볼륨으로 남겨 둔다.
+SELFSPAR_TRIVY_CACHE_DIR = Path(os.environ.get('SELFSPAR_TRIVY_CACHE_DIR', '/data/trivy-cache'))
 
 
 # Password validation

@@ -1,0 +1,69 @@
+{
+  "SchemaVersion": 2,
+  "Trivy": {
+    "Version": "0.76.2"
+  },
+  "ArtifactName": "/src/npm",
+  "ArtifactType": "filesystem",
+  "Results": [
+    {
+      "Target": "package-lock.json",
+      "Class": "lang-pkgs",
+      "Type": "npm",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2021-23337",
+          "PkgID": "lodash@4.17.20",
+          "PkgName": "lodash",
+          "InstalledVersion": "4.17.20",
+          "FixedVersion": "4.17.21",
+          "Status": "fixed",
+          "SeveritySource": "ghsa",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2021-23337",
+          "Title": "nodejs-lodash: command injection via template",
+          "Severity": "HIGH",
+          "PublishedDate": "2021-02-15T13:15:12.56Z"
+        },
+        {
+          "VulnerabilityID": "CVE-2026-4800",
+          "PkgID": "lodash@4.17.20",
+          "PkgName": "lodash",
+          "InstalledVersion": "4.17.20",
+          "FixedVersion": "4.18.0",
+          "Status": "fixed",
+          "SeveritySource": "ghsa",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2026-4800",
+          "Title": "lodash: lodash: Arbitrary code execution via untrusted input in template imports",
+          "Severity": "HIGH",
+          "PublishedDate": "2026-03-31T20:16:29.66Z"
+        },
+        {
+          "VulnerabilityID": "CVE-2020-28500",
+          "PkgID": "lodash@4.17.20",
+          "PkgName": "lodash",
+          "InstalledVersion": "4.17.20",
+          "FixedVersion": "4.17.21",
+          "Status": "fixed",
+          "SeveritySource": "ghsa",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2020-28500",
+          "Title": "nodejs-lodash: ReDoS via the toNumber, trim and trimEnd functions",
+          "Severity": "MEDIUM",
+          "PublishedDate": "2021-02-15T11:15:12.397Z"
+        },
+        {
+          "VulnerabilityID": "CVE-2025-13465",
+          "PkgID": "lodash@4.17.20",
+          "PkgName": "lodash",
+          "InstalledVersion": "4.17.20",
+          "FixedVersion": "4.17.23",
+          "Status": "fixed",
+          "SeveritySource": "ghsa",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2025-13465",
+          "Title": "lodash: prototype pollution in _.unset and _.omit functions",
+          "Severity": "MEDIUM",
+          "PublishedDate": "2026-01-21T20:16:05.25Z"
+        }
+      ]
+    }
+  ]
+}

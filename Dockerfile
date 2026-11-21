@@ -2,10 +2,10 @@
 
 # 단계(stage)를 나눠서 최종 이미지에는 실행에 필요한 것만 남긴다.
 #   python-deps    : uv로 파이썬 의존성을 /opt/venv에 설치한다 (uv는 여기에만 있다)
-#   tools-download : 점검 도구를 내려받고 체크섬을 확인한다 (curl은 여기에만 있다)
+#   tools-download : 점검 도구를 내려받고 체크섬·서명을 확인한다 (curl·cosign은 여기에만 있다)
 #   runtime        : web·worker 공통 바탕 (파이썬 + 의존성 + 일반 사용자)
 #   web            : API 서버. git·점검 도구가 없다
-#   worker         : 점검 실행. git + 점검 도구가 있다
+#   worker         : 점검 실행. git + 점검 도구(gitleaks, trivy)가 있다
 # docker-compose.yml이 서비스마다 target으로 web 또는 worker를 고른다.
 
 # 이미지는 태그와 함께 digest(내용의 지문)로 고정한다. 태그는 나중에 다른 내용을 가리키게 바뀔 수 있다.
@@ -13,6 +13,10 @@ ARG PYTHON_IMAGE=python:3.14.10-slim-trixie@sha256:9aaa474097d094040649f2162a627
 
 
 FROM ghcr.io/astral-sh/uv:0.13.8@sha256:5cc1805e2426484abca4ad46ea783bab281fdb225fd82d8ce6d66a81254bac85 AS uv
+
+
+# 내려받은 점검 도구의 서명을 확인하는 도구(Sigstore cosign). 실행 파일만 꺼내 쓴다.
+FROM ghcr.io/sigstore/cosign/cosign:v3.1.4@sha256:0f06154836d2de34f887a5c273506d52ca43edaa1d9e53e6510fa78a48f69c2d AS cosign
 
 
 FROM ${PYTHON_IMAGE} AS python-deps
@@ -64,6 +68,28 @@ RUN case "$TARGETARCH" in \
     && tar -xzf /tmp/gitleaks.tar.gz --no-same-owner -C /usr/local/bin gitleaks \
     && rm /tmp/gitleaks.tar.gz
 
+# 의존성 취약점 점검 도구. 2026년 3월에 trivy 배포 과정이 뚫려 악성 버전(v0.69.4 등)이 올라온 적이 있어서 두 번 확인한다.
+#   1) 체크섬: 고정해 둔 값과 같은 파일인지 (이 버전을 고른 뒤 누가 바꿔치기하지 않았는지)
+#   2) 서명: aquasecurity/trivy 저장소의 공식 배포 작업이 그 태그로 만든 파일인지
+COPY --from=cosign /ko-app/cosign /usr/local/bin/cosign
+ARG TRIVY_VERSION=0.76.2
+RUN case "$TARGETARCH" in \
+      amd64) arch=64bit; sum=bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf ;; \
+      arm64) arch=ARM64; sum=ab9d51f86e6a5fb936f605faff6b593ac51bc378fff4d3e8b9d58358b9c367c3 ;; \
+      *) echo "지원하지 않는 CPU입니다: $TARGETARCH"; exit 1 ;; \
+    esac \
+    && file="trivy_${TRIVY_VERSION}_Linux-${arch}.tar.gz" \
+    && url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}" \
+    && curl -fsSL -o "/tmp/${file}" "${url}/${file}" \
+    && curl -fsSL -o "/tmp/${file}.sigstore.json" "${url}/${file}.sigstore.json" \
+    && echo "${sum}  /tmp/${file}" | sha256sum -c - \
+    && cosign verify-blob "/tmp/${file}" \
+       --bundle "/tmp/${file}.sigstore.json" \
+       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+       --certificate-identity "https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/v${TRIVY_VERSION}" \
+    && tar -xzf "/tmp/${file}" --no-same-owner -C /usr/local/bin trivy \
+    && rm "/tmp/${file}" "/tmp/${file}.sigstore.json"
+
 
 FROM ${PYTHON_IMAGE} AS runtime
 
@@ -101,10 +127,14 @@ RUN apt-get update \
 # git은 주인이 다른 저장소를 기본으로 거부해서, 붙인 저장소를 읽을 수 있게 허용한다.
 RUN git config --system --add safe.directory '*'
 
-COPY --from=tools-download /usr/local/bin/gitleaks /usr/local/bin/gitleaks
+COPY --from=tools-download /usr/local/bin/gitleaks /usr/local/bin/trivy /usr/local/bin/
 
-# 점검 도구의 원본 결과를 보관하는 폴더. docker-compose.yml의 볼륨이 처음 만들어질 때 이 주인을 물려받는다.
-RUN mkdir -p /data/scan-results && chown selfspar /data/scan-results
+# trivy의 모든 명령(fs, version 등)에서 사용 통계 전송과 새 버전 확인 접속을 끈다.
+ENV TRIVY_DISABLE_TELEMETRY=true \
+    TRIVY_SKIP_VERSION_CHECK=true
+
+# 점검 도구의 원본 결과와 trivy 취약점 DB를 두는 폴더. docker-compose.yml의 볼륨이 처음 만들어질 때 이 주인을 물려받는다.
+RUN mkdir -p /data/scan-results /data/trivy-cache && chown selfspar /data/scan-results /data/trivy-cache
 
 COPY . .
 
