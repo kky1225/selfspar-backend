@@ -15,6 +15,11 @@ class Scan(models.Model):
     ACTIVE = (Status.QUEUED, Status.RUNNING)
 
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='scans')
+    # 지난 점검의 일부 칸만 다시 돌린 재점검이면 그 지난 점검. 비어 있으면 전체 점검이다.
+    # 재점검은 지난 점검에 딸린 후속 기록이라 지난 점검을 지우면 함께 지운다(GitHub Actions의 재실행과 같다).
+    source_scan = models.ForeignKey(
+        'self', on_delete=models.CASCADE, null=True, blank=True, related_name='rescans', verbose_name='다시 점검한 점검',
+    )
     status = models.CharField('상태', max_length=10, choices=Status.choices, default=Status.QUEUED)
     created_at = models.DateTimeField('시작일', auto_now_add=True)
     finished_at = models.DateTimeField('종료일', null=True, blank=True)

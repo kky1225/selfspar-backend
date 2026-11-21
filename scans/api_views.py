@@ -11,7 +11,7 @@ from projects.models import Project
 
 from .models import ModuleRun, Scan
 from .modules import MODULES
-from .serializers import ScanDetailSerializer, ScanSummarySerializer
+from .serializers import RescanSerializer, ScanDetailSerializer, ScanSummarySerializer
 from .tasks import run_scan
 
 logger = logging.getLogger(__name__)
@@ -38,20 +38,30 @@ class ScanListCreateApi(APIView):
         if project.scans.filter(status__in=Scan.ACTIVE).exists():
             return Response(ALREADY_RUNNING, status=status.HTTP_409_CONFLICT)
 
-        # 전체 점검: 모든 대상 × 그 대상에 해당하는 모든 모듈
-        pairs = [(target, module) for target in project.targets.all() for module in MODULES if module.applies_to(target)]
-        if not pairs:
-            return Response(
-                {'detail': '실행할 수 있는 점검이 없습니다. 지금은 저장소 대상만 점검할 수 있습니다.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        if request.data:
+            # 재점검: 지난 점검에서 고른 칸만 새 점검으로 다시 돌린다. 예: {"source_scan": 8, "run_ids": [31, 32]}
+            serializer = RescanSerializer(data=request.data, context={'project': project})
+            serializer.is_valid(raise_exception=True)
+            source_scan = serializer.validated_data['source_scan']
+            pairs = serializer.validated_data['pairs']
+        else:
+            # 전체 점검: 모든 대상 × 그 대상에 해당하는 모든 모듈
+            source_scan = None
+            pairs = [
+                (target, module.key) for target in project.targets.all() for module in MODULES if module.applies_to(target)
+            ]
+            if not pairs:
+                return Response(
+                    {'detail': '실행할 수 있는 점검이 없습니다. 지금은 저장소 대상만 점검할 수 있습니다.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         try:
             # 점검과 모듈 실행들을 한 번에 저장한다. 중간에 실패하면 둘 다 저장하지 않는다(@Transactional과 같다).
             with transaction.atomic():
-                scan = Scan.objects.create(project=project)
+                scan = Scan.objects.create(project=project, source_scan=source_scan)
                 ModuleRun.objects.bulk_create(
-                    ModuleRun(scan=scan, target=target, module=module.key) for target, module in pairs
+                    ModuleRun(scan=scan, target=target, module=module_key) for target, module_key in pairs
                 )
         except IntegrityError:
             # 위의 exists() 검사와 저장 사이에 다른 요청이 먼저 점검을 만든 경우. DB 제약이 막아 준다.

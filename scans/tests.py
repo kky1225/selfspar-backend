@@ -47,9 +47,9 @@ class ScanApiTestCase(TestCase):
         self.run_scan = patcher.start()
         self.addCleanup(patcher.stop)
 
-    def start(self, project=None, client=None):
+    def start(self, project=None, client=None, data=None):
         url = reverse('api_scan_list', args=[(project or self.project).pk])
-        return (client or self.client).post(url, content_type='application/json')
+        return (client or self.client).post(url, data, content_type='application/json')
 
 
 class ScanCreateApiTests(ScanApiTestCase):
@@ -67,9 +67,13 @@ class ScanCreateApiTests(ScanApiTestCase):
         data = response.json()
         self.assertEqual(data['id'], scan.pk)
         self.assertEqual(data['status_label'], '대기')
+        self.assertIsNone(data['source_scan'])
         self.assertEqual(
             data['modules'],
-            [{'key': 'secrets', 'label': '시크릿 유출'}, {'key': 'dependencies', 'label': '의존성 취약점'}],
+            [
+                {'key': 'secrets', 'label': '시크릿 유출', 'kinds': ['repo']},
+                {'key': 'dependencies', 'label': '의존성 취약점', 'kinds': ['repo']},
+            ],
         )
 
     def test_만든_점검을_worker에_보낸다(self):
@@ -145,6 +149,110 @@ class ScanCreateApiTests(ScanApiTestCase):
 
         self.assertEqual(response.status_code, 403)
         self.assertFalse(Scan.objects.exists())
+
+
+class ScanRescanApiTests(ScanApiTestCase):
+    def setUp(self):
+        super().setUp()
+        # 끝난 지난 점검. 저장소 대상의 시크릿 칸은 발견, 의존성 칸은 실패였다.
+        self.source = Scan.objects.create(project=self.project, status=Scan.Status.DONE)
+        self.secrets_run = ModuleRun.objects.create(
+            scan=self.source, target=self.repo, module='secrets', status=ModuleRun.Status.FOUND, finding_count=2,
+        )
+        self.deps_run = ModuleRun.objects.create(
+            scan=self.source, target=self.repo, module='dependencies', status=ModuleRun.Status.FAILED,
+        )
+
+    def rescan(self, run_ids, source=None):
+        return self.start(data={'source_scan': (source or self.source).pk, 'run_ids': run_ids})
+
+    def test_고른_칸만_새_점검으로_다시_돌린다(self):
+        response = self.rescan([self.deps_run.pk])
+
+        self.assertEqual(response.status_code, 201)
+        scan = Scan.objects.get(pk=response.json()['id'])
+        self.assertEqual(scan.source_scan, self.source)
+        self.assertEqual(response.json()['source_scan'], self.source.pk)
+        self.assertEqual(list(scan.runs.values_list('target', 'module', 'status')), [(self.repo.pk, 'dependencies', 'queued')])
+        self.run_scan.delay.assert_called_once_with(scan.pk)
+
+    def test_지난_점검의_칸은_그대로_둔다(self):
+        self.rescan([self.secrets_run.pk, self.deps_run.pk])
+
+        self.secrets_run.refresh_from_db()
+        self.assertEqual((self.secrets_run.scan, self.secrets_run.status), (self.source, ModuleRun.Status.FOUND))
+        self.assertEqual(self.source.runs.count(), 2)
+
+    def test_같은_칸을_여러_번_보내도_한_번만_돌린다(self):
+        response = self.rescan([self.deps_run.pk, self.deps_run.pk])
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Scan.objects.get(pk=response.json()['id']).runs.count(), 1)
+
+    def test_재점검을_다시_점검할_수_있다(self):
+        first = Scan.objects.get(pk=self.rescan([self.deps_run.pk]).json()['id'])
+        first.status = Scan.Status.DONE
+        first.save()
+
+        response = self.rescan([first.runs.get().pk], source=first)
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Scan.objects.get(pk=response.json()['id']).source_scan, first)
+
+    def assert_rejected(self, response, field):
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(field, response.json())
+        # 지난 점검 하나만 남아 있어야 한다.
+        self.assertEqual(Scan.objects.count(), 1)
+        self.run_scan.delay.assert_not_called()
+
+    def test_칸을_하나도_고르지_않으면_400이다(self):
+        self.assert_rejected(self.rescan([]), 'run_ids')
+
+    def test_다른_점검의_칸이_섞이면_400이다(self):
+        other = Scan.objects.create(project=self.project, status=Scan.Status.DONE)
+        other_run = ModuleRun.objects.create(scan=other, target=self.repo, module='secrets')
+
+        response = self.rescan([self.deps_run.pk, other_run.pk])
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('run_ids', response.json())
+        self.assertEqual(Scan.objects.count(), 2)
+
+    def test_다른_프로젝트의_점검은_400이다(self):
+        other_project = Project.objects.create(name='investfeed')
+        other = Scan.objects.create(project=other_project, status=Scan.Status.DONE)
+
+        self.assertEqual(self.rescan([self.deps_run.pk], source=other).status_code, 400)
+        self.assertFalse(Scan.objects.filter(source_scan__isnull=False).exists())
+
+    def test_없는_점검은_400이다(self):
+        self.assert_rejected(self.start(data={'source_scan': 9999, 'run_ids': [self.deps_run.pk]}), 'source_scan')
+
+    def test_지금은_없는_모듈의_칸은_400이다(self):
+        removed = ModuleRun.objects.create(scan=self.source, target=self.repo, module='removed')
+
+        self.assert_rejected(self.rescan([removed.pk]), 'run_ids')
+
+    def test_대상_종류가_바뀌어_해당하지_않는_칸은_400이다(self):
+        self.repo.kind = Target.Kind.API
+        self.repo.save()
+
+        self.assert_rejected(self.rescan([self.deps_run.pk]), 'run_ids')
+
+    def test_실행_중인_점검이_있으면_409이다(self):
+        Scan.objects.create(project=self.project, status=Scan.Status.RUNNING)
+
+        self.assertEqual(self.rescan([self.deps_run.pk]).status_code, 409)
+        self.assertFalse(Scan.objects.filter(source_scan__isnull=False).exists())
+
+    def test_지난_점검을_지우면_재점검도_함께_지운다(self):
+        scan_id = self.rescan([self.deps_run.pk]).json()['id']
+
+        self.source.delete()
+
+        self.assertFalse(Scan.objects.filter(pk=scan_id).exists())
+        self.assertFalse(ModuleRun.objects.filter(scan_id=scan_id).exists())
 
 
 class ScanListApiTests(ScanApiTestCase):
