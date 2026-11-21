@@ -61,6 +61,21 @@ class FindingSaveTests(TestCase):
         self.assertEqual(set(same.runs.all()), {first, second})
         self.assertEqual(second.finding_count, 2)
 
+    def test_다시_나온_발견은_이번_결과로_내용을_바꾼다(self):
+        # 의존성 취약점은 DB가 갱신되면 같은 취약점이라도 심각도와 고친 버전이 새로 생긴다.
+        first = finding_data('fp-1')
+        first.severity, first.evidence, first.extra = 'info', 'lodash 4.17.20 (아직 고친 버전 없음)', {'fixed_version': ''}
+        self.run_with(first)
+        again = finding_data('fp-1')
+        again.severity, again.evidence, again.extra = 'high', 'lodash 4.17.20 → 4.17.21에서 고침', {'fixed_version': '4.17.21'}
+        self.run_with(again)
+
+        finding = Finding.objects.get()
+        self.assertEqual(
+            (finding.severity, finding.evidence, finding.extra),
+            ('high', 'lodash 4.17.20 → 4.17.21에서 고침', {'fixed_version': '4.17.21'}),
+        )
+
     def test_한_결과_안에서_겹친_발견은_하나로_센다(self):
         run = self.run_with(finding_data('fp-1'), finding_data('fp-1'))
 
@@ -95,17 +110,18 @@ class RunFindingListApiTests(TestCase):
         scan = Scan.objects.create(project=self.project, status=Scan.Status.DONE)
         return ModuleRun.objects.create(scan=scan, target=self.target, module='secrets', status=ModuleRun.Status.FOUND)
 
-    def finding(self, fingerprint, *runs):
+    def finding(self, fingerprint, *runs, severity=Finding.Severity.CRITICAL):
         finding = Finding.objects.create(
             target=self.target, module='secrets', fingerprint=fingerprint, rule_id='generic-api-key',
-            title='Generic API Key', severity=Finding.Severity.CRITICAL, location='application.yml:16',
+            title='Generic API Key', severity=severity, location='application.yml:16',
             evidence='api-key: REDACTED', extra={'commit': 'abc123', 'date': '2025-01-18T12:07:29Z'},
         )
         finding.runs.add(*runs)
         return finding
 
-    def get(self, run, client=None):
-        return (client or self.client).get(reverse('api_run_findings', args=[run.pk]))
+    def get(self, run, client=None, page=None):
+        params = {'page': page} if page else {}
+        return (client or self.client).get(reverse('api_run_findings', args=[run.pk]), params)
 
     def test_칸에서_찾은_발견만_돌려준다(self):
         run = self.make_run()
@@ -116,7 +132,8 @@ class RunFindingListApiTests(TestCase):
         response = self.get(run)
 
         self.assertEqual(response.status_code, 200)
-        [data] = response.json()
+        self.assertEqual(response.json()['count'], 1)
+        [data] = response.json()['results']
         self.assertEqual(data['rule_id'], 'generic-api-key')
         self.assertEqual(data['severity_label'], '치명')
         self.assertEqual(data['location'], 'application.yml:16')
@@ -129,13 +146,45 @@ class RunFindingListApiTests(TestCase):
         self.finding('계속', old, new)
         self.finding('새로', new)
 
-        data = {item['id']: item['first_scan_id'] for item in self.get(new).json()}
+        data = {item['id']: item['first_scan_id'] for item in self.get(new).json()['results']}
 
         continued = Finding.objects.get(fingerprint='계속')
         fresh = Finding.objects.get(fingerprint='새로')
         # 이번 점검 칸으로 걸렀어도, 이전 점검에서 본 기록까지 따져야 한다.
         self.assertEqual(data[continued.pk], old.scan_id)
         self.assertEqual(data[fresh.pk], new.scan_id)
+
+    def test_심각한_것부터_돌려준다(self):
+        run = self.make_run()
+        for fingerprint, severity in [('정보', 'info'), ('보통', 'medium'), ('치명', 'critical'), ('낮음', 'low'), ('높음', 'high')]:
+            self.finding(fingerprint, run, severity=severity)
+
+        severities = [item['severity'] for item in self.get(run).json()['results']]
+
+        # 글자 순(critical, high, info, low, medium)이 아니라 심각도 순이어야 한다.
+        self.assertEqual(severities, ['critical', 'high', 'medium', 'low', 'info'])
+
+    def test_50건씩_나눠서_돌려준다(self):
+        run = self.make_run()
+        for i in range(51):
+            self.finding(f'fp-{i}', run)
+
+        first = self.get(run).json()
+        second = self.get(run, page=2).json()
+
+        self.assertEqual((first['count'], len(first['results'])), (51, 50))
+        self.assertIsNotNone(first['next'])
+        self.assertEqual(len(second['results']), 1)
+        self.assertIsNone(second['next'])
+        # 두 쪽에 겹치거나 빠진 발견이 없다.
+        ids = [item['id'] for item in first['results'] + second['results']]
+        self.assertEqual(sorted(ids), sorted(Finding.objects.values_list('id', flat=True)))
+
+    def test_없는_쪽은_404이다(self):
+        run = self.make_run()
+        self.finding('fp-1', run)
+
+        self.assertEqual(self.get(run, page=2).status_code, 404)
 
     def test_없는_칸은_404이다(self):
         self.assertEqual(self.client.get(reverse('api_run_findings', args=[9999])).status_code, 404)

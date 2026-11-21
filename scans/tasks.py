@@ -61,8 +61,13 @@ def run_module(run):
     run.save()
 
 
+# 다시 나온 발견에서 이번 결과로 바꿔 쓰는 칸. 같은 취약점이라도 DB가 갱신되면 심각도·고친 버전·제목이 바뀐다.
+REFRESHED_FIELDS = ['rule_id', 'title', 'severity', 'location', 'evidence', 'extra']
+
+
 def save_findings(run, items):
-    """발견을 저장하고 이 모듈 실행에 잇는다. 이미 있는 발견(같은 대상·모듈·fingerprint)은 새로 만들지 않고 다시 잇기만 한다."""
+    """발견을 저장하고 이 모듈 실행에 잇는다. 이미 있는 발견(같은 대상·모듈·fingerprint)은 새로 만들지 않고,
+    내용을 이번 결과로 바꾼 뒤 다시 잇는다."""
     # 한 번의 결과 안에 같은 발견이 두 번 나와도 하나로 센다. 먼저 나온 것을 쓴다.
     unique = {}
     for item in items:
@@ -72,6 +77,12 @@ def save_findings(run, items):
         finding.fingerprint: finding
         for finding in Finding.objects.filter(target=run.target, module=run.module, fingerprint__in=list(unique))
     }
+    for fingerprint, finding in existing.items():
+        for field in REFRESHED_FIELDS:
+            setattr(finding, field, getattr(unique[fingerprint], field))
+    # 한 건씩 save()하지 않고 UPDATE 한 번으로 바꾼다.
+    Finding.objects.bulk_update(existing.values(), REFRESHED_FIELDS)
+
     new = [
         Finding(
             target=run.target, module=run.module, fingerprint=item.fingerprint, rule_id=item.rule_id,
