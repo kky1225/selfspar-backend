@@ -16,8 +16,8 @@ from .tasks import run_scan
 
 logger = logging.getLogger(__name__)
 
-ALREADY_RUNNING = {'detail': '이미 실행 중인 점검이 있습니다. 끝난 뒤에 다시 실행하세요.'}
-FINISHED_RUN = (ModuleRun.Status.PASSED, ModuleRun.Status.FOUND, ModuleRun.Status.FAILED)
+ALREADY_RUNNING = {'detail': '이미 실행 중인 점검이 있습니다. 끝나거나 취소한 뒤에 다시 실행하세요.'}
+FINISHED_RUN = (ModuleRun.Status.PASSED, ModuleRun.Status.FOUND, ModuleRun.Status.FAILED, ModuleRun.Status.CANCELLED)
 
 
 class ScanListCreateApi(APIView):
@@ -79,6 +79,21 @@ class ScanListCreateApi(APIView):
             )
 
         return Response(ScanDetailSerializer(scan).data, status=status.HTTP_201_CREATED)
+
+
+class ScanCancelApi(APIView):
+    """점검 취소. DB에 '취소'만 적고 바로 응답한다(협조적 취소).
+    worker는 칸을 시작하기 전과 도구가 도는 동안 이 상태를 확인하고, 취소되었으면 도구를 멈추고 결과를 저장하지 않는다.
+    worker가 죽어서 '실행 중'으로 멈춘 점검도 이것으로 풀 수 있다."""
+
+    def post(self, request, pk):
+        # select_for_update: 이 점검 줄을 잠가서, 같은 점검을 동시에 취소하거나 worker가 상태를 바꾸는 것과 겹치지 않게 한다.
+        with transaction.atomic():
+            scan = get_object_or_404(Scan.objects.select_for_update(), pk=pk)
+            if scan.status not in Scan.ACTIVE:
+                return Response({'detail': '이미 끝난 점검입니다.'}, status=status.HTTP_409_CONFLICT)
+            scan.cancel()
+        return Response(ScanDetailSerializer(scan).data)
 
 
 class ScanDetailApi(APIView):

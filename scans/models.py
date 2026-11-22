@@ -1,4 +1,5 @@
 from django.db import models
+from django.utils import timezone
 
 from projects.models import Project, Target
 
@@ -10,6 +11,7 @@ class Scan(models.Model):
         QUEUED = 'queued', '대기'
         RUNNING = 'running', '실행 중'
         DONE = 'done', '완료'
+        CANCELLED = 'cancelled', '취소'
 
     # 아직 끝나지 않은 상태. 프로젝트마다 이 상태의 점검은 하나만 둘 수 있다.
     ACTIVE = (Status.QUEUED, Status.RUNNING)
@@ -40,6 +42,15 @@ class Scan(models.Model):
     def __str__(self):
         return f'{self.project} / 점검 #{self.pk}'
 
+    def cancel(self):
+        """끝나지 않은 점검을 취소한다. 끝난 칸의 결과는 그대로 두고, 끝나지 않은 칸만 취소로 바꾼다.
+        부르는 쪽에서 트랜잭션을 열고 이 점검 줄을 잠근 뒤에 부른다."""
+        now = timezone.now()
+        self.status = self.Status.CANCELLED
+        self.finished_at = now
+        self.save(update_fields=['status', 'finished_at'])
+        self.runs.filter(status__in=ModuleRun.ACTIVE).update(status=ModuleRun.Status.CANCELLED, finished_at=now)
+
 
 class ModuleRun(models.Model):
     """모듈 실행 기록 1건(이력). 점검 1회 안에서 대상 하나에 모듈 하나를 실행한 결과다.
@@ -51,6 +62,11 @@ class ModuleRun(models.Model):
         PASSED = 'passed', '이상 없음'
         FOUND = 'found', '발견'
         FAILED = 'failed', '실패'
+        # 점검을 취소해서 실행하지 않았거나 도중에 멈춘 칸
+        CANCELLED = 'cancelled', '취소'
+
+    # 아직 끝나지 않은 상태. 점검을 취소하면 이 상태의 칸을 모두 취소로 바꾼다.
+    ACTIVE = (Status.QUEUED, Status.RUNNING)
 
     scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='runs')
     target = models.ForeignKey(Target, on_delete=models.CASCADE, related_name='module_runs')

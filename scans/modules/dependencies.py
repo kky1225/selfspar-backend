@@ -48,7 +48,7 @@ class DependenciesModule(ScanModule):
     }
     TITLE_LIMIT = 300
 
-    def run(self, target):
+    def run(self, target, cancelled):
         path = target.config['path']
         if not os.path.isdir(path):
             raise ScanError(
@@ -84,7 +84,7 @@ class DependenciesModule(ScanModule):
                 '--disable-telemetry',
                 '--skip-version-check',
                 '--quiet',
-            ])
+            ], cancelled)
             if result.returncode != 0:
                 raise ScanError(f'trivy 실행에 실패했습니다. {last_lines(result.stderr)}')
             raw_output = report.read_bytes()
@@ -95,7 +95,7 @@ class DependenciesModule(ScanModule):
             raise ScanError('trivy 결과 파일을 읽지 못했습니다.')
 
         return ModuleResult(
-            tool_version=self.tool_version(cache_dir),
+            tool_version=self.tool_version(cache_dir, cancelled),
             raw_output=raw_output,
             findings=[
                 self.to_finding(result['Target'], vuln)
@@ -150,9 +150,9 @@ class DependenciesModule(ScanModule):
         poetry = data.get('tool', {}).get('poetry', {})
         return bool(data.get('project', {}).get('dependencies') or poetry.get('dependencies'))
 
-    def tool_version(self, cache_dir):
+    def tool_version(self, cache_dir, cancelled):
         """trivy 버전과 취약점 DB 날짜. DB가 언제 것이냐에 따라 같은 코드도 결과가 달라지므로 둘 다 남긴다. 예: 0.76.2 (DB 2026-11-20)"""
-        result = self.run_command(['trivy', 'version', '--format', 'json', '--cache-dir', cache_dir])
+        result = self.run_command(['trivy', 'version', '--format', 'json', '--cache-dir', cache_dir], cancelled)
         if result.returncode != 0:
             raise ScanError(f'trivy 버전을 확인하지 못했습니다. {last_lines(result.stderr)}')
         try:

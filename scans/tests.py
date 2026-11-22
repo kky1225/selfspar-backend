@@ -3,13 +3,15 @@ import os
 import secrets
 import string
 import subprocess
+import sys
+import time
 import unittest
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.db import IntegrityError
+from django.db import DatabaseError, IntegrityError
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 
@@ -17,9 +19,10 @@ from projects.models import Project, Target
 
 from .models import ModuleRun, Scan
 from .modules import MODULES_BY_KEY
-from .modules.base import FindingData, ModuleResult, ScanError, ScanModule
+from .modules.base import Cancelled, FindingData, ModuleResult, ScanError, ScanModule, never_cancelled
 from .modules.dependencies import DependenciesModule
 from .modules.secrets import SecretsModule
+from . import tasks
 from .tasks import run_scan
 
 
@@ -255,6 +258,79 @@ class ScanRescanApiTests(ScanApiTestCase):
         self.assertFalse(ModuleRun.objects.filter(scan_id=scan_id).exists())
 
 
+class ScanCancelApiTests(ScanApiTestCase):
+    def cancel(self, scan, client=None):
+        return (client or self.client).post(reverse('api_scan_cancel', args=[scan.pk]), content_type='application/json')
+
+    def make_scan(self, status=Scan.Status.RUNNING):
+        scan = Scan.objects.create(project=self.project, status=status)
+        self.done_run = ModuleRun.objects.create(
+            scan=scan, target=self.repo, module='secrets', status=ModuleRun.Status.FOUND, finding_count=2,
+        )
+        self.running_run = ModuleRun.objects.create(
+            scan=scan, target=self.repo, module='dependencies', status=ModuleRun.Status.RUNNING,
+        )
+        self.queued_run = ModuleRun.objects.create(scan=scan, target=self.api, module='other')
+        return scan
+
+    def test_실행_중인_점검을_취소하면_끝나지_않은_칸만_취소로_바꾼다(self):
+        scan = self.make_scan()
+
+        response = self.cancel(scan)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['status_label'], '취소')
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Scan.Status.CANCELLED)
+        self.assertIsNotNone(scan.finished_at)
+        statuses = dict(scan.runs.values_list('pk', 'status'))
+        self.assertEqual(statuses, {
+            self.done_run.pk: ModuleRun.Status.FOUND,
+            self.running_run.pk: ModuleRun.Status.CANCELLED,
+            self.queued_run.pk: ModuleRun.Status.CANCELLED,
+        })
+
+    def test_대기_중인_점검도_취소할_수_있다(self):
+        self.assertEqual(self.cancel(self.make_scan(Scan.Status.QUEUED)).status_code, 200)
+
+    def test_취소하면_바로_새_점검을_시작할_수_있다(self):
+        self.cancel(self.make_scan())
+
+        self.assertEqual(self.start().status_code, 201)
+
+    def test_끝난_점검은_409이고_그대로_둔다(self):
+        for finished in [Scan.Status.DONE, Scan.Status.CANCELLED]:
+            with self.subTest(status=finished):
+                scan = Scan.objects.create(project=self.project, status=finished)
+                run = ModuleRun.objects.create(scan=scan, target=self.repo, module='secrets', status=ModuleRun.Status.FAILED)
+
+                response = self.cancel(scan)
+
+                self.assertEqual(response.status_code, 409)
+                scan.refresh_from_db()
+                run.refresh_from_db()
+                self.assertEqual((scan.status, run.status), (finished, ModuleRun.Status.FAILED))
+
+    def test_없는_점검은_404이다(self):
+        response = self.client.post(reverse('api_scan_cancel', args=[9999]))
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_로그인하지_않으면_403이다(self):
+        scan = self.make_scan()
+
+        self.assertEqual(self.cancel(scan, client=Client()).status_code, 403)
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Scan.Status.RUNNING)
+
+    def test_CSRF_토큰_없이는_취소할_수_없다(self):
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+        scan = self.make_scan()
+
+        self.assertEqual(self.cancel(scan, client=client).status_code, 403)
+
+
 class ScanListApiTests(ScanApiTestCase):
     def test_최근_점검부터_칸_상태별_개수와_발견_건수를_함께_돌려준다(self):
         old = Scan.objects.create(project=self.project, status=Scan.Status.DONE)
@@ -342,12 +418,16 @@ class FakeModule(ScanModule):
 
     kinds = (Target.Kind.REPO,)
 
-    def __init__(self, key, result=None, error=None):
+    def __init__(self, key, result=None, error=None, during_run=None):
         self.key = key
         self.result = result
         self.error = error
+        # 도구가 도는 도중에 일어나는 일(예: 점검 취소)을 흉내 낸다.
+        self.during_run = during_run
 
-    def run(self, target):
+    def run(self, target, cancelled):
+        if self.during_run:
+            self.during_run()
         if self.error:
             raise self.error
         return self.result
@@ -436,15 +516,211 @@ class RunScanTests(TestCase):
         self.assertEqual(self.scan.status, Scan.Status.DONE)
         self.assertIsNotNone(self.scan.finished_at)
 
-    def test_실행기_자체가_멈춰도_점검은_완료로_바꿔_다음_점검을_막지_않는다(self):
-        self.make_run('found')
+    def test_칸을_끝내다_오류가_나도_그_칸만_실패로_두고_다음_칸으로_넘어간다(self):
+        broken = self.make_run('found')
+        later = self.make_run('passed')
+        real_run_module = tasks.run_module
 
-        with patch('scans.tasks.run_module', side_effect=RuntimeError('버그')):
-            with self.assertRaises(RuntimeError):
+        def first_breaks(run):
+            if run.pk == broken.pk:
+                raise RuntimeError('실패 기록 중 DB 오류')
+            return real_run_module(run)
+
+        with patch('scans.tasks.run_module', side_effect=first_breaks):
+            with self.assertLogs('scans.tasks', 'ERROR'):
+                run_scan(self.scan.pk)
+
+        broken.refresh_from_db()
+        later.refresh_from_db()
+        self.scan.refresh_from_db()
+        self.assertEqual((broken.status, broken.error_message), (ModuleRun.Status.FAILED, tasks.RUNNER_ERROR))
+        self.assertEqual(later.status, ModuleRun.Status.PASSED)
+        self.assertEqual(self.scan.status, Scan.Status.DONE)
+
+    def test_실행기_자체가_멈춰도_점검은_완료로_끝나지_않은_칸은_실패로_바꾼다(self):
+        first = self.make_run('found')
+        second = self.make_run('passed')
+        real_fail_unfinished = tasks.fail_unfinished
+        calls = []
+
+        def flaky(runs):
+            # 칸 하나의 실패 기록까지 실패해서 반복 전체가 멈추는 경우를 만든다. 마지막 정리는 정상으로 돈다.
+            calls.append(runs)
+            if len(calls) == 1:
+                raise DatabaseError('DB 연결 끊김')
+            return real_fail_unfinished(runs)
+
+        with patch('scans.tasks.run_module', side_effect=RuntimeError('버그')), \
+                patch('scans.tasks.fail_unfinished', side_effect=flaky):
+            with self.assertLogs('scans.tasks', 'ERROR'), self.assertRaises(DatabaseError):
                 run_scan(self.scan.pk)
 
         self.scan.refresh_from_db()
         self.assertEqual(self.scan.status, Scan.Status.DONE)
+        for run in (first, second):
+            run.refresh_from_db()
+            self.assertEqual((run.status, run.error_message), (ModuleRun.Status.FAILED, tasks.RUNNER_ERROR))
+
+    def test_실행기가_멈춰도_이미_끝난_칸의_결과는_그대로_둔다(self):
+        done = self.make_run('found')
+        broken = self.make_run('passed')
+        real_run_module = tasks.run_module
+        real_fail_unfinished = tasks.fail_unfinished
+
+        def second_breaks(run):
+            if run.pk == broken.pk:
+                raise RuntimeError('버그')
+            return real_run_module(run)
+
+        calls = []
+
+        def first_call_breaks(runs):
+            calls.append(runs)
+            if len(calls) == 1:
+                raise DatabaseError('DB 연결 끊김')
+            return real_fail_unfinished(runs)
+
+        with patch('scans.tasks.run_module', side_effect=second_breaks), \
+                patch('scans.tasks.fail_unfinished', side_effect=first_call_breaks):
+            with self.assertLogs('scans.tasks', 'ERROR'), self.assertRaises(DatabaseError):
+                run_scan(self.scan.pk)
+
+        done.refresh_from_db()
+        broken.refresh_from_db()
+        self.assertEqual((done.status, done.finding_count), (ModuleRun.Status.FOUND, 3))
+        self.assertEqual(broken.status, ModuleRun.Status.FAILED)
+
+    def cancel_scan(self):
+        """web에서 취소 요청이 들어온 것처럼 점검을 취소한다."""
+        scan = Scan.objects.get(pk=self.scan.pk)
+        scan.cancel()
+
+    def assert_cancelled(self, *runs):
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.status, Scan.Status.CANCELLED)
+        for run in runs:
+            run.refresh_from_db()
+            self.assertEqual(run.status, ModuleRun.Status.CANCELLED)
+
+    def test_시작하기_전에_취소된_점검은_실행하지_않는다(self):
+        run = self.make_run('found')
+        self.cancel_scan()
+
+        run_scan(self.scan.pk)
+
+        self.assert_cancelled(run)
+        self.assertIsNone(run.started_at)
+        self.assertFalse(run.findings.exists())
+
+    def test_도구가_도는_중에_취소되면_결과를_저장하지_않고_남은_칸도_실행하지_않는다(self):
+        MODULES_BY_KEY['cancel_while_running'] = FakeModule(
+            'cancel_while_running', ModuleResult('1.0.0', b'[1]', [finding_data('fp-1')]), during_run=self.cancel_scan,
+        )
+        running = self.make_run('cancel_while_running')
+        later = self.make_run('found')
+
+        run_scan(self.scan.pk)
+
+        self.assert_cancelled(running, later)
+        # 취소 뒤에 도구가 결과를 내도 저장하지 않는다.
+        self.assertEqual((running.finding_count, running.raw_output_path), (0, ''))
+        self.assertFalse(running.findings.exists())
+        self.assertIsNone(later.started_at)
+
+    def test_도구를_멈춰서_끝나면_칸은_취소로_남는다(self):
+        MODULES_BY_KEY['stopped'] = FakeModule('stopped', error=Cancelled(), during_run=self.cancel_scan)
+        run = self.make_run('stopped')
+
+        run_scan(self.scan.pk)
+
+        self.assert_cancelled(run)
+        self.assertEqual(run.error_message, '')
+
+    def test_취소한_뒤에_도구가_실패해도_취소를_덮어쓰지_않는다(self):
+        MODULES_BY_KEY['fail_after_cancel'] = FakeModule(
+            'fail_after_cancel', error=ScanError('trivy 실행에 실패했습니다'), during_run=self.cancel_scan,
+        )
+        run = self.make_run('fail_after_cancel')
+
+        run_scan(self.scan.pk)
+
+        self.assert_cancelled(run)
+
+    def test_끝난_칸은_취소해도_결과가_남는다(self):
+        done = self.make_run('found')
+        MODULES_BY_KEY['cancel_while_running'] = FakeModule(
+            'cancel_while_running', ModuleResult('1.0.0', b'[]'), during_run=self.cancel_scan,
+        )
+        self.make_run('cancel_while_running')
+
+        run_scan(self.scan.pk)
+
+        done.refresh_from_db()
+        self.assertEqual((done.status, done.finding_count), (ModuleRun.Status.FOUND, 3))
+
+
+class RunCommandTests(TestCase):
+    """도구 실행과 멈추기. 실제 프로세스를 띄워서 확인한다."""
+
+    def setUp(self):
+        self.module = ScanModule()
+        # 확인 간격과 멈출 때 기다리는 시간을 줄여서 테스트가 빨리 끝나게 한다.
+        for name, value in [('CANCEL_CHECK_INTERVAL', 0.1), ('STOP_GRACE', 0.5)]:
+            patcher = patch(f'scans.modules.base.{name}', value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def python(self, code):
+        return [sys.executable, '-c', code]
+
+    def test_도구의_출력과_종료_코드를_돌려준다(self):
+        result = self.module.run_command(self.python('import sys; print("ok"); sys.exit(3)'), never_cancelled)
+
+        self.assertEqual((result.returncode, result.stdout.strip()), (3, b'ok'))
+
+    def test_취소되면_도구를_멈춘다(self):
+        started = time.monotonic()
+        with self.assertRaises(Cancelled):
+            self.module.run_command(self.python('import time; time.sleep(30)'), lambda: True)
+
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_끝내라는_신호를_무시하는_도구는_강제로_끝낸다(self):
+        code = 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'
+        started = time.monotonic()
+        with self.assertRaises(Cancelled):
+            self.module.run_command(self.python(code), lambda: True)
+
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_도구가_띄운_하위_프로세스까지_멈춘다(self):
+        # 하위 프로세스(sleep)가 출력 통로를 물려받는다. 도구만 멈추면 sleep이 끝날 때까지 기다리게 된다.
+        code = 'import subprocess, time; subprocess.Popen(["sleep", "30"]); time.sleep(30)'
+        started = time.monotonic()
+        with self.assertRaises(Cancelled):
+            self.module.run_command(self.python(code), lambda: True)
+
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_취소를_확인하다_오류가_나도_도구를_멈춘다(self):
+        def broken():
+            raise RuntimeError('DB 연결 끊김')
+
+        started = time.monotonic()
+        with self.assertRaisesMessage(RuntimeError, 'DB 연결 끊김'):
+            self.module.run_command(self.python('import time; time.sleep(30)'), broken)
+
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_제한_시간을_넘기면_멈추고_실패한다(self):
+        self.module.timeout = 0.3
+
+        with self.assertRaisesMessage(ScanError, '제한 시간'):
+            self.module.run_command(self.python('import time; time.sleep(30)'), never_cancelled)
+
+    def test_없는_도구는_실패한다(self):
+        with self.assertRaisesMessage(ScanError, '설치되어 있지 않습니다'):
+            self.module.run_command(['no-such-tool'], never_cancelled)
 
 
 def fake_github_token():
@@ -473,7 +749,7 @@ class SecretsModuleTests(TestCase):
         self.git('-c', 'user.name=selfspar', '-c', 'user.email=selfspar@example.com', 'commit', '-q', '-m', 'test')
 
     def run_module(self):
-        return self.module.run(Target(kind='repo', config={'path': str(self.repo)}))
+        return self.module.run(Target(kind='repo', config={'path': str(self.repo)}), never_cancelled)
 
     def test_커밋한_토큰을_찾고_결과에는_값을_가려서_남긴다(self):
         token = fake_github_token()
@@ -535,7 +811,7 @@ class SecretsModuleTests(TestCase):
 
     def test_폴더가_없으면_실패한다(self):
         with self.assertRaisesMessage(ScanError, '저장소 폴더를 찾을 수 없습니다'):
-            self.module.run(Target(kind='repo', config={'path': '/no/such/repo'}))
+            self.module.run(Target(kind='repo', config={'path': '/no/such/repo'}), never_cancelled)
 
     def test_git_저장소가_아니면_실패한다(self):
         # gitleaks만 돌리면 이 경우 '유출 없음'으로 끝난다. 점검 전에 막아야 한다.
@@ -571,7 +847,7 @@ class DependenciesModuleTests(TestCase):
         self.report = TRIVY_NPM_REPORT
         self.commands = []
 
-    def fake_run_command(self, args):
+    def fake_run_command(self, args, cancelled):
         """trivy fs는 --output 자리에 결과 파일을 쓰고, trivy version은 버전 JSON을 출력한 것처럼 꾸민다."""
         self.commands.append(args)
         if args[1] == 'fs':
@@ -581,7 +857,7 @@ class DependenciesModuleTests(TestCase):
 
     def run_module(self):
         with patch.object(self.module, 'run_command', side_effect=self.fake_run_command):
-            return self.module.run(Target(kind='repo', config={'path': str(self.repo)}))
+            return self.module.run(Target(kind='repo', config={'path': str(self.repo)}), never_cancelled)
 
     def test_취약점마다_발견_하나로_바꾼다(self):
         result = self.run_module()
@@ -702,16 +978,16 @@ class DependenciesModuleTests(TestCase):
         self.assertEqual(finding.title, 'CVE-2026-0001')
 
     def test_trivy가_실패하면_실패한다(self):
-        def failing(args):
+        def failing(args, cancelled):
             return subprocess.CompletedProcess(args, 1, b'', b'FATAL failed to download vulnerability DB')
 
         with patch.object(self.module, 'run_command', side_effect=failing):
             with self.assertRaisesMessage(ScanError, 'failed to download vulnerability DB'):
-                self.module.run(Target(kind='repo', config={'path': str(self.repo)}))
+                self.module.run(Target(kind='repo', config={'path': str(self.repo)}), never_cancelled)
 
     def test_폴더가_없으면_실패한다(self):
         with self.assertRaisesMessage(ScanError, '저장소 폴더를 찾을 수 없습니다'):
-            self.module.run(Target(kind='repo', config={'path': '/no/such/repo'}))
+            self.module.run(Target(kind='repo', config={'path': '/no/such/repo'}), never_cancelled)
 
     def test_저장소_대상에만_해당한다(self):
         self.assertTrue(self.module.applies_to(Target(kind='repo')))
@@ -737,7 +1013,7 @@ class DependenciesModuleIntegrationTests(TestCase):
                 },
             }))
 
-            result = DependenciesModule().run(Target(kind='repo', config={'path': repo}))
+            result = DependenciesModule().run(Target(kind='repo', config={'path': repo}), never_cancelled)
 
         self.assertIn('package-lock.json:lodash:4.17.20:CVE-2021-23337', [f.fingerprint for f in result.findings])
         self.assertRegex(result.tool_version, r'^\d+\.\d+\.\d+ \(DB \d{4}-\d{2}-\d{2}\)$')

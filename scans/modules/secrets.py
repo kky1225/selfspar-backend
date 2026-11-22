@@ -20,7 +20,7 @@ class SecretsModule(ScanModule):
     # 근거 줄을 저장할 때 남기는 최대 글자 수
     EVIDENCE_LIMIT = 300
 
-    def run(self, target):
+    def run(self, target, cancelled):
         path = target.config['path']
         if not os.path.isdir(path):
             raise ScanError(
@@ -30,11 +30,11 @@ class SecretsModule(ScanModule):
 
         # gitleaks는 git이 이력을 못 읽어도 오류를 로그에만 남기고 '유출 없음'(0)으로 끝난다.
         # 그러면 점검을 못 했는데 이상 없음으로 보이므로, 먼저 git이 이 폴더를 저장소로 읽는지 확인한다.
-        repo_check = self.run_command(['git', '-C', path, 'rev-parse', '--git-dir'])
+        repo_check = self.run_command(['git', '-C', path, 'rev-parse', '--git-dir'], cancelled)
         if repo_check.returncode != 0:
             raise ScanError(f'git 저장소로 읽지 못했습니다: {path} {last_lines(repo_check.stderr)}')
 
-        version = self.run_command(['gitleaks', 'version'])
+        version = self.run_command(['gitleaks', 'version'], cancelled)
         if version.returncode != 0:
             raise ScanError(f'gitleaks 버전을 확인하지 못했습니다. {last_lines(version.stderr)}')
 
@@ -50,7 +50,7 @@ class SecretsModule(ScanModule):
                 '--no-banner',
                 '--no-color',
                 '--exit-code', str(self.LEAKS_FOUND),
-            ])
+            ], cancelled)
             if result.returncode not in (0, self.LEAKS_FOUND):
                 raise ScanError(f'gitleaks 실행에 실패했습니다. {last_lines(result.stderr)}')
             raw_output = report.read_bytes()
