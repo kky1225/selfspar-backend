@@ -1,5 +1,6 @@
 """worker가 실행하는 작업. web은 run_scan.delay(점검 번호)로 요청만 넣고 바로 응답한다."""
 import logging
+from datetime import timedelta
 
 from celery import shared_task
 from django.conf import settings
@@ -16,6 +17,17 @@ logger = logging.getLogger(__name__)
 
 UNEXPECTED_ERROR = '예상하지 못한 오류로 점검하지 못했습니다. worker 로그를 확인하세요.'
 RUNNER_ERROR = '점검 실행기 오류로 이 칸을 끝내지 못했습니다. worker 로그를 확인하세요.'
+WORKER_LOST = 'worker가 응답하지 않아 이 칸을 끝내지 못했습니다. worker가 다시 시작되었거나 멈췄습니다.'
+
+# 실행 중인 점검이 이만큼 아무 신호도 남기지 않으면 worker가 멈춘 것으로 본다.
+# 신호(Scan.heartbeat_at)는 점검과 칸을 시작할 때, 그리고 도구가 도는 동안 2초마다 남긴다.
+# Airflow도 작업의 신호가 5분 동안 끊기면 멈춘 작업(좀비)으로 보고 실패 처리한다.
+STALE_AFTER = timedelta(minutes=5)
+# 대기인 점검이 이만큼 지나도 시작되지 않으면 실행 요청이 사라진 것으로 보고 취소한다(예: redis를 다시 만듦).
+# 정상 대기는 길어야 몇십 분이다. 프로젝트마다 대기 점검은 하나이고 worker가 2개씩 돌리므로, 가장 늦은 점검의 대기는
+# (프로젝트 수 / 2 - 1) × 점검 하나의 시간이다. 예: 프로젝트 20개를 한꺼번에 넣어도 점검 하나가 13분 안에 끝나면 넘지 않는다.
+# 하루보다 짧아야 매일 도는 점검이 갇혀도 다음 날 점검을 막지 않는다.
+QUEUED_EXPIRES = timedelta(hours=2)
 
 # 점검은 web의 취소 요청(ScanCancelApi)과 동시에 바뀔 수 있다. 그래서 상태는 읽고 나서 저장하지 않고,
 # "아직 그 상태일 때만 바꾼다"는 조건을 붙인 UPDATE 한 번으로 바꾼다. 바뀐 줄이 0이면 그 사이 취소된 것이다.
@@ -24,7 +36,9 @@ RUNNER_ERROR = '점검 실행기 오류로 이 칸을 끝내지 못했습니다.
 @shared_task
 def run_scan(scan_id):
     # 대기 중일 때만 시작한다. 시작하기 전에 취소된 점검이면 아무것도 하지 않는다.
-    if not Scan.objects.filter(pk=scan_id, status=Scan.Status.QUEUED).update(status=Scan.Status.RUNNING):
+    if not Scan.objects.filter(pk=scan_id, status=Scan.Status.QUEUED).update(
+        status=Scan.Status.RUNNING, heartbeat_at=timezone.now(),
+    ):
         logger.info('점검 #%s는 대기 중이 아니라서 실행하지 않음', scan_id)
         return
     try:
@@ -41,7 +55,7 @@ def run_scan(scan_id):
         # 점검 전체가 도중에 멈춰도(예: 칸 목록을 읽거나 위의 실패 기록에서 다시 오류) 점검은 완료로,
         # 끝나지 않은 칸은 실패로 바꾼다. 그래야 '실행 중'으로 남아 다음 점검을 막지 않고, 화면에도 실패로 보인다.
         # 취소된 점검은 취소할 때 이미 끝냈으므로 그대로 둔다.
-        # DB가 계속 내려가 있으면 이것도 실패한다. 그때는 DB가 돌아온 뒤 화면에서 점검을 취소해 푼다.
+        # DB가 계속 내려가 있으면 이것도 실패한다. 그때는 DB가 돌아온 뒤 정리 작업(cleanup_stale_scans)이 5분쯤 뒤에 정리한다.
         reset_broken_connection()
         with transaction.atomic():
             if Scan.objects.filter(pk=scan_id, status=Scan.Status.RUNNING).update(
@@ -58,11 +72,43 @@ def reset_broken_connection():
         close_old_connections()
 
 
-def fail_unfinished(runs):
-    """끝나지 않은 칸(대기, 실행 중)을 실행기 오류로 실패 처리한다. 이미 끝났거나 취소된 칸은 그대로 둔다."""
+def fail_unfinished(runs, error_message=RUNNER_ERROR):
+    """끝나지 않은 칸(대기, 실행 중)을 실패 처리한다. 이미 끝났거나 취소된 칸은 그대로 둔다."""
     runs.filter(status__in=ModuleRun.ACTIVE).update(
-        status=ModuleRun.Status.FAILED, error_message=RUNNER_ERROR, finished_at=timezone.now(),
+        status=ModuleRun.Status.FAILED, error_message=error_message, finished_at=timezone.now(),
     )
+
+
+@shared_task
+def cleanup_stale_scans():
+    """worker가 멈춰 끝나지 않은 점검을 정리한다. Celery beat가 1분마다 부른다(settings.CELERY_BEAT_SCHEDULE).
+    worker가 도중에 강제로 꺼지면 run_scan의 finally도 실행되지 않아서, 점검이 '실행 중'으로 남아 다음 점검을 막는다."""
+    now = timezone.now()
+    cutoff = now - STALE_AFTER
+
+    for scan_id in Scan.objects.filter(
+        status=Scan.Status.RUNNING, heartbeat_at__lt=cutoff,
+    ).values_list('pk', flat=True):
+        # run_scan의 마무리와 같다: 점검은 완료로, 끝나지 않은 칸은 실패로.
+        # 찾은 뒤에 취소되었거나 신호가 새로 들어왔으면 조건에 맞지 않아 바꾸지 않는다.
+        # 정리한 뒤에 worker가 사실은 살아 있었다면, 다음 취소 확인에서 점검이 '실행 중'이 아닌 것을 보고 도구를 멈추고,
+        # 결과도 칸이 '실행 중'일 때만 저장하므로 이 실패를 덮어쓰지 않는다.
+        with transaction.atomic():
+            if Scan.objects.filter(pk=scan_id, status=Scan.Status.RUNNING, heartbeat_at__lt=cutoff).update(
+                status=Scan.Status.DONE, finished_at=now,
+            ):
+                fail_unfinished(ModuleRun.objects.filter(scan_id=scan_id), WORKER_LOST)
+                logger.warning('점검 #%s는 worker 신호가 %s 넘게 없어서 정리함', scan_id, STALE_AFTER)
+
+    for scan_id in Scan.objects.filter(
+        status=Scan.Status.QUEUED, created_at__lt=now - QUEUED_EXPIRES,
+    ).values_list('pk', flat=True):
+        # 취소 API와 같은 방법으로 취소한다. 줄을 잠그므로 그 사이 worker가 시작하려 하면 취소가 끝난 뒤 '대기'가 아닌 것을 보고 건너뛴다.
+        with transaction.atomic():
+            scan = Scan.objects.select_for_update().filter(pk=scan_id, status=Scan.Status.QUEUED).first()
+            if scan:
+                scan.cancel()
+                logger.warning('점검 #%s는 %s 넘게 시작되지 않아서 취소함', scan_id, QUEUED_EXPIRES)
 
 
 def run_module(run):
@@ -74,10 +120,16 @@ def run_module(run):
     ):
         return
     run.status, run.started_at = ModuleRun.Status.RUNNING, started_at
+    # 칸을 넘어갈 때마다 신호를 남긴다. 금방 끝나는 칸만 이어져서 아래 취소 확인이 한 번도 불리지 않아도 신호가 끊기지 않는다.
+    Scan.objects.filter(pk=run.scan_id, status=Scan.Status.RUNNING).update(heartbeat_at=started_at)
 
     def cancelled():
-        # 취소하면 web이 칸을 '취소'로 바꾸므로, 더 이상 '실행 중'이 아니면 취소된 것이다.
-        return not ModuleRun.objects.filter(pk=run.pk, status=ModuleRun.Status.RUNNING).exists()
+        # 확인하면서 살아 있다는 신호(Scan.heartbeat_at)도 남긴다. 도구가 도는 동안 2초마다 불린다.
+        # 점검이 더 이상 '실행 중'이 아니면 바뀐 줄이 0이고, 도구를 멈춰야 한다.
+        # 그런 경우는 사용자가 점검을 취소했거나(칸도 함께 취소됨), 정리 작업이 멈춘 점검으로 처리했을 때(칸은 실패)다.
+        return not Scan.objects.filter(pk=run.scan_id, status=Scan.Status.RUNNING).update(
+            heartbeat_at=timezone.now(),
+        )
 
     module = MODULES_BY_KEY[run.module]
     try:

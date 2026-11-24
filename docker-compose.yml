@@ -75,6 +75,25 @@ services:
       redis:
         condition: service_healthy
 
+  # 정해 둔 때가 되면 작업 요청을 Redis에 넣는 스케줄러(Celery beat). 작업은 worker가 실행한다.
+  # worker마다 스케줄을 돌리면 같은 작업이 여러 번 실행되므로 하나만 따로 띄운다(Celery 공식 문서 권장).
+  # 요청만 넣어서 점검 도구가 필요 없으므로 web 이미지를 쓴다.
+  beat:
+    build:
+      context: .
+      target: web
+      args:
+        UV_NO_DEV: "false"
+    # 스케줄(settings.py의 CELERY_BEAT_SCHEDULE)을 고치면 다시 읽도록 worker처럼 watchfiles로 띄운다.
+    # 마지막 실행 시각을 적는 파일은 코드 폴더(/app)가 아니라 /tmp에 둔다.
+    command: ["watchfiles", "--filter", "python", "celery.__main__.main", "--args", "-A config beat --loglevel=info --schedule /tmp/celerybeat-schedule"]
+    env_file: .env
+    volumes:
+      - .:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+
 volumes:
   pgdata:
   scanresults:

@@ -68,7 +68,8 @@ docker compose up -d --build
 ## 구성
 
 - `web`: Django 6.1 + DRF (Python 3.14). 내 컴퓨터의 `127.0.0.1:8800`에만 열린다. git과 점검 도구가 없는 이미지를 쓴다.
-- `worker`: 점검을 실제로 실행한다(Celery). git과 점검 도구(gitleaks, trivy)가 들어 있다. `.py` 파일을 고치면 자동으로 다시 뜬다(watchfiles). 이때 실행 중이던 점검은 중단되고 '실행 중'으로 남아, 그 프로젝트의 새 점검이 막힌다. 점검 결과 화면에서 그 점검을 취소하면 풀린다.
+- `worker`: 점검을 실제로 실행한다(Celery). git과 점검 도구(gitleaks, trivy)가 들어 있다. `.py` 파일을 고치면 자동으로 다시 뜬다(watchfiles). 이때 실행 중이던 점검은 중단된다. 중단된 점검은 5분쯤 뒤 `beat`가 정리하고(끝나지 않은 칸은 실패), 바로 풀려면 점검 결과 화면에서 취소한다.
+- `beat`: 정해 둔 때마다 작업 요청을 넣는 스케줄러(Celery beat). 1분마다 worker가 멈춰 끝나지 않은 점검과 2시간 넘게 대기인 점검을 정리한다.
 - `redis`: `web`이 점검 요청을 넣고 `worker`가 꺼내 가는 곳. 외부로 열리지 않는다.
 - `db`: PostgreSQL 18. 외부로 열리지 않고 `web`, `worker`에서만 접속한다.
 

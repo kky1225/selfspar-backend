@@ -7,13 +7,18 @@ import sys
 import time
 import unittest
 import tempfile
+from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.db import DatabaseError, IntegrityError
+from django.db import DatabaseError, IntegrityError, transaction
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 
 from projects.models import Project, Target
 
@@ -433,6 +438,22 @@ class FakeModule(ScanModule):
         return self.result
 
 
+class CheckingModule(ScanModule):
+    """도는 도중에 취소 확인 함수를 불러 보고, 돌려받은 답을 남기는 가짜 모듈"""
+
+    key = 'checking'
+    kinds = (Target.Kind.REPO,)
+
+    def __init__(self, before_check):
+        self.before_check = before_check
+        self.answers = []
+
+    def run(self, target, cancelled):
+        self.before_check()
+        self.answers.append(cancelled())
+        return ModuleResult('1.0.0', b'[]')
+
+
 class RunScanTests(TestCase):
     def setUp(self):
         self.results_dir = tempfile.TemporaryDirectory()
@@ -657,6 +678,223 @@ class RunScanTests(TestCase):
 
         done.refresh_from_db()
         self.assertEqual((done.status, done.finding_count), (ModuleRun.Status.FOUND, 3))
+
+    def test_점검을_시작할_때_신호를_남긴다(self):
+        # 칸이 없어서 칸 시작 신호는 없고, 점검 시작 신호만 남는다.
+        run_scan(self.scan.pk)
+
+        self.scan.refresh_from_db()
+        self.assertIsNotNone(self.scan.heartbeat_at)
+
+    def test_칸을_시작할_때마다_신호를_남긴다(self):
+        seen = []
+
+        def record_heartbeat():
+            seen.append(Scan.objects.get(pk=self.scan.pk).heartbeat_at)
+
+        MODULES_BY_KEY['first'] = FakeModule('first', ModuleResult('1.0.0', b'[]'), during_run=record_heartbeat)
+        MODULES_BY_KEY['second'] = FakeModule('second', ModuleResult('1.0.0', b'[]'), during_run=record_heartbeat)
+        first = self.make_run('first')
+        second = self.make_run('second')
+
+        run_scan(self.scan.pk)
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(seen, [first.started_at, second.started_at])
+
+    def test_도구가_도는_동안_취소를_확인하면서_살아_있다는_신호를_남긴다(self):
+        long_ago = timezone.now() - timedelta(minutes=10)
+
+        def make_heartbeat_old():
+            Scan.objects.filter(pk=self.scan.pk).update(heartbeat_at=long_ago)
+
+        module = MODULES_BY_KEY['checking'] = CheckingModule(before_check=make_heartbeat_old)
+        run = self.make_run('checking')
+
+        run_scan(self.scan.pk)
+
+        self.scan.refresh_from_db()
+        run.refresh_from_db()
+        self.assertEqual(module.answers, [False])
+        self.assertGreater(self.scan.heartbeat_at, long_ago)
+        self.assertEqual(run.status, ModuleRun.Status.PASSED)
+
+    def test_취소된_칸은_취소를_확인하면_취소됐다고_답한다(self):
+        module = MODULES_BY_KEY['checking'] = CheckingModule(before_check=self.cancel_scan)
+        run = self.make_run('checking')
+
+        run_scan(self.scan.pk)
+
+        self.assertEqual(module.answers, [True])
+        self.assert_cancelled(run)
+
+    def test_worker가_멈춘_것으로_정리된_뒤에는_결과를_저장하지_않고_남은_칸도_실행하지_않는다(self):
+        def looks_stopped():
+            # 도구가 도는 도중에 신호가 5분 넘게 끊긴 것처럼 만들고 정리 작업을 돌린다(worker가 아주 느렸던 경우).
+            Scan.objects.filter(pk=self.scan.pk).update(heartbeat_at=timezone.now() - timedelta(minutes=6))
+            with self.assertLogs('scans.tasks', 'WARNING'):
+                tasks.cleanup_stale_scans()
+
+        MODULES_BY_KEY['slow'] = FakeModule(
+            'slow', ModuleResult('1.0.0', b'[1]', [finding_data('fp-1')]), during_run=looks_stopped,
+        )
+        slow = self.make_run('slow')
+        later = self.make_run('found')
+
+        run_scan(self.scan.pk)
+
+        self.scan.refresh_from_db()
+        slow.refresh_from_db()
+        later.refresh_from_db()
+        self.assertEqual(self.scan.status, Scan.Status.DONE)
+        self.assertEqual((slow.status, slow.error_message, slow.finding_count), (ModuleRun.Status.FAILED, tasks.WORKER_LOST, 0))
+        self.assertFalse(slow.findings.exists())
+        self.assertEqual((later.status, later.error_message), (ModuleRun.Status.FAILED, tasks.WORKER_LOST))
+        self.assertIsNone(later.started_at)
+
+
+class CleanupStaleScansTests(TestCase):
+    """worker가 멈춰 끝나지 않은 점검 정리(cleanup_stale_scans)"""
+
+    def setUp(self):
+        self.project = Project.objects.create(name='karaoke')
+        self.target = make_target(self.project)
+        now = timezone.now()
+        self.long_ago = now - timedelta(minutes=6)
+        self.recently = now - timedelta(minutes=1)
+
+    def make_scan(self, status=Scan.Status.RUNNING, created_at=None, heartbeat_at=None):
+        scan = Scan.objects.create(project=self.project)
+        # created_at은 만들 때 자동으로 지금이 들어가서, 지난 시각은 만든 뒤에 바꾼다.
+        Scan.objects.filter(pk=scan.pk).update(
+            status=status, created_at=created_at or self.long_ago, heartbeat_at=heartbeat_at,
+        )
+        scan.refresh_from_db()
+        return scan
+
+    def make_run(self, scan, module, **fields):
+        return ModuleRun.objects.create(scan=scan, target=self.target, module=module, **fields)
+
+    def assert_status(self, obj, status, error_message=None):
+        obj.refresh_from_db()
+        self.assertEqual(obj.status, status)
+        if error_message is not None:
+            self.assertEqual(obj.error_message, error_message)
+
+    def test_신호가_5분_넘게_끊긴_점검은_완료로_끝나지_않은_칸은_실패로_바꾼다(self):
+        scan = self.make_scan(heartbeat_at=self.long_ago)
+        done = self.make_run(scan, 'a', status=ModuleRun.Status.PASSED, started_at=self.long_ago, finished_at=self.long_ago)
+        running = self.make_run(scan, 'b', status=ModuleRun.Status.RUNNING, started_at=self.long_ago)
+        queued = self.make_run(scan, 'c')
+
+        with self.assertLogs('scans.tasks', 'WARNING'):
+            tasks.cleanup_stale_scans()
+
+        self.assert_status(scan, Scan.Status.DONE)
+        self.assertIsNotNone(scan.finished_at)
+        self.assert_status(done, ModuleRun.Status.PASSED, '')
+        self.assert_status(running, ModuleRun.Status.FAILED, tasks.WORKER_LOST)
+        self.assert_status(queued, ModuleRun.Status.FAILED, tasks.WORKER_LOST)
+
+    def test_신호가_최근에_있으면_그대로_둔다(self):
+        scan = self.make_scan(heartbeat_at=self.recently)
+        running = self.make_run(scan, 'a', status=ModuleRun.Status.RUNNING, started_at=self.long_ago)
+        queued = self.make_run(scan, 'b')
+
+        tasks.cleanup_stale_scans()
+
+        self.assert_status(scan, Scan.Status.RUNNING)
+        self.assert_status(running, ModuleRun.Status.RUNNING)
+        self.assert_status(queued, ModuleRun.Status.QUEUED)
+
+    def test_오래_대기했어도_방금_실행을_시작한_점검은_그대로_둔다(self):
+        # worker가 꺼져 있는 동안 기다리다가 방금 시작한 경우. 시작할 때 신호를 남겨서 만든 시각과 상관없다.
+        scan = self.make_scan(created_at=timezone.now() - timedelta(hours=3), heartbeat_at=self.recently)
+        queued = self.make_run(scan, 'a')
+
+        tasks.cleanup_stale_scans()
+
+        self.assert_status(scan, Scan.Status.RUNNING)
+        self.assert_status(queued, ModuleRun.Status.QUEUED)
+
+    def test_찾은_뒤에_신호가_들어오면_정리하지_않는다(self):
+        scan = self.make_scan(heartbeat_at=self.long_ago)
+        running = self.make_run(scan, 'a', status=ModuleRun.Status.RUNNING, started_at=self.long_ago)
+        calls = []
+
+        @contextmanager
+        def heartbeat_arrives(*args, **kwargs):
+            # 멈춘 점검을 찾은 뒤, 바꾸기 직전에 worker가 신호를 남긴 경우를 만든다.
+            calls.append(args)
+            Scan.objects.filter(pk=scan.pk).update(heartbeat_at=timezone.now())
+            with transaction.atomic(*args, **kwargs):
+                yield
+
+        # tasks.py가 쓰는 transaction 이름만 바꾼다. Django 전체의 transaction.atomic은 그대로 둔다.
+        with patch('scans.tasks.transaction', SimpleNamespace(atomic=heartbeat_arrives)):
+            tasks.cleanup_stale_scans()
+
+        self.assertEqual(len(calls), 1)
+        self.assert_status(scan, Scan.Status.RUNNING)
+        self.assert_status(running, ModuleRun.Status.RUNNING)
+
+    def test_신호가_없는_실행_중_점검은_건드리지_않는다(self):
+        # 신호 기능을 넣기 전에 시작한 점검. 자동으로 정리하지 않고 화면에서 취소해 푼다.
+        scan = self.make_scan(heartbeat_at=None)
+
+        tasks.cleanup_stale_scans()
+
+        self.assert_status(scan, Scan.Status.RUNNING)
+
+    def test_끝났거나_취소된_점검은_건드리지_않는다(self):
+        for status in (Scan.Status.DONE, Scan.Status.CANCELLED):
+            with self.subTest(status=status):
+                scan = self.make_scan(status=status, heartbeat_at=self.long_ago)
+                run = self.make_run(scan, 'a', status=ModuleRun.Status.CANCELLED, started_at=self.long_ago)
+
+                tasks.cleanup_stale_scans()
+
+                self.assert_status(scan, status)
+                self.assert_status(run, ModuleRun.Status.CANCELLED, '')
+
+    def test_2시간_넘게_대기인_점검은_취소한다(self):
+        scan = self.make_scan(status=Scan.Status.QUEUED, created_at=timezone.now() - timedelta(hours=2, minutes=1))
+        queued = self.make_run(scan, 'a')
+
+        with self.assertLogs('scans.tasks', 'WARNING'):
+            tasks.cleanup_stale_scans()
+
+        self.assert_status(scan, Scan.Status.CANCELLED)
+        self.assertIsNotNone(scan.finished_at)
+        self.assert_status(queued, ModuleRun.Status.CANCELLED)
+
+    def test_2시간이_안_된_대기_점검은_그대로_둔다(self):
+        scan = self.make_scan(status=Scan.Status.QUEUED, created_at=timezone.now() - timedelta(hours=1, minutes=59))
+        queued = self.make_run(scan, 'a')
+
+        tasks.cleanup_stale_scans()
+
+        self.assert_status(scan, Scan.Status.QUEUED)
+        self.assert_status(queued, ModuleRun.Status.QUEUED)
+
+    def test_정리한_점검의_프로젝트는_바로_새_점검을_시작할_수_있다(self):
+        scan = self.make_scan(heartbeat_at=self.long_ago)
+        self.make_run(scan, 'a', status=ModuleRun.Status.RUNNING, started_at=self.long_ago)
+
+        with self.assertLogs('scans.tasks', 'WARNING'):
+            tasks.cleanup_stale_scans()
+
+        self.assertFalse(self.project.scans.filter(status__in=Scan.ACTIVE).exists())
+
+
+class BeatScheduleTests(TestCase):
+    def test_정리_작업을_1분마다_실행하도록_등록되어_있다(self):
+        entry = settings.CELERY_BEAT_SCHEDULE['cleanup-stale-scans']
+        self.assertEqual(entry['task'], tasks.cleanup_stale_scans.name)
+        self.assertEqual(entry['schedule'], 60.0)
+        # worker가 꺼져 있던 동안 쌓인 요청은 버린다.
+        self.assertEqual(entry['options']['expires'], 60)
 
 
 class RunCommandTests(TestCase):

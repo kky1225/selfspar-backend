@@ -124,6 +124,16 @@ CELERY_BROKER_URL = 'redis://redis:6379/0'
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 # 점검 결과는 DB(ModuleRun)에 직접 적으므로 Celery의 결과 저장 기능은 쓰지 않는다.
 CELERY_TASK_IGNORE_RESULT = True
+# 정해 둔 때마다 실행할 작업. beat 컨테이너가 때가 되면 Redis에 요청을 넣고 worker가 실행한다(Spring의 @Scheduled와 같은 역할).
+CELERY_BEAT_SCHEDULE = {
+    'cleanup-stale-scans': {
+        'task': 'scans.tasks.cleanup_stale_scans',
+        # 초 단위
+        'schedule': 60.0,
+        # worker가 꺼져 있는 동안 쌓인 요청은 worker가 다시 떴을 때 한꺼번에 돌지 않고 버린다. 다음 1분에 다시 들어온다.
+        'options': {'expires': 60},
+    },
+}
 
 # 점검 도구가 낸 원본 결과 파일을 두는 폴더. docker-compose.yml에서 볼륨으로 붙인다.
 SELFSPAR_SCAN_RESULTS_DIR = Path(os.environ.get('SELFSPAR_SCAN_RESULTS_DIR', '/data/scan-results'))

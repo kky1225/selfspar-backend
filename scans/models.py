@@ -24,6 +24,8 @@ class Scan(models.Model):
     )
     status = models.CharField('상태', max_length=10, choices=Status.choices, default=Status.QUEUED)
     created_at = models.DateTimeField('시작일', auto_now_add=True)
+    # 실행 중인 점검을 돌리는 worker가 잠시마다 남기는 시각(살아 있다는 신호). 오래 끊기면 worker가 멈춘 것으로 본다.
+    heartbeat_at = models.DateTimeField('마지막 신호', null=True, blank=True)
     finished_at = models.DateTimeField('종료일', null=True, blank=True)
 
     class Meta:

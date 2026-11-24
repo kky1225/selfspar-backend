@@ -61,7 +61,9 @@ class ScanModule:
 
     def run(self, target, cancelled):
         """대상을 점검하고 ModuleResult를 돌려준다. 실패하면 ScanError를 일으킨다.
-        cancelled는 점검이 취소되었는지 알려 주는 함수다. 도구를 실행할 때 run_command에 그대로 넘긴다."""
+        cancelled는 점검이 취소되었는지 알려 주는 함수다. 도구를 실행할 때 run_command에 그대로 넘긴다.
+        cancelled를 부를 때마다 worker가 살아 있다는 신호도 남는다. 도구 밖에서 오래 걸리는 처리(몇 분 이상)를 넣을 때는
+        중간중간 cancelled()를 불러야 한다. 5분 넘게 부르지 않으면 worker가 멈춘 것으로 보고 칸을 실패로 정리한다."""
         raise NotImplementedError
 
     def run_command(self, args, cancelled):
