@@ -9,15 +9,15 @@ from django.urls import reverse
 from projects.models import Project
 from scans.models import ModuleRun, Scan
 from scans.modules import MODULES_BY_KEY
-from scans.modules.base import ModuleResult
+from scans.modules.base import ModuleResult, ScanError
 from scans.tasks import run_scan
 from scans.tests import FakeModule, finding_data, make_target
 
-from .models import Finding
+from .models import Finding, FindingEvent
 
 
-class FindingSaveTests(TestCase):
-    """worker가 점검 결과의 발견을 저장하는 방식"""
+class FindingRunTestCase(TestCase):
+    """가짜 모듈로 점검을 끝까지 돌려 보는 테스트의 공통 준비와 도우미"""
 
     def setUp(self):
         results_dir = tempfile.TemporaryDirectory()
@@ -29,15 +29,21 @@ class FindingSaveTests(TestCase):
         self.project = Project.objects.create(name='karaoke')
         self.target = make_target(self.project)
 
-    def run_with(self, *items):
+    def run_with(self, *items, module='fake'):
         """가짜 모듈이 items를 찾은 것으로 점검을 한 번 끝까지 실행하고, 그 칸을 돌려준다."""
-        fake = FakeModule('fake', ModuleResult('1.0.0', b'[]', list(items)))
-        with patch.dict(MODULES_BY_KEY, {'fake': fake}):
+        return self.run_fake(FakeModule(module, ModuleResult('1.0.0', b'[]', list(items))))
+
+    def run_fake(self, fake):
+        with patch.dict(MODULES_BY_KEY, {fake.key: fake}):
             scan = Scan.objects.create(project=self.project)
-            run = ModuleRun.objects.create(scan=scan, target=self.target, module='fake')
+            run = ModuleRun.objects.create(scan=scan, target=self.target, module=fake.key)
             run_scan(scan.pk)
         run.refresh_from_db()
         return run
+
+
+class FindingSaveTests(FindingRunTestCase):
+    """worker가 점검 결과의 발견을 저장하는 방식"""
 
     def test_찾은_발견을_저장하고_칸에_잇는다(self):
         run = self.run_with(finding_data('fp-1', 'settings.py:3'), finding_data('fp-2'))
@@ -97,6 +103,119 @@ class FindingSaveTests(TestCase):
         self.assertEqual(run.status, ModuleRun.Status.FAILED)
         self.assertEqual(run.finding_count, 0)
         self.assertFalse(Finding.objects.exists())
+
+
+class FindingStatusTests(FindingRunTestCase):
+    """점검이 끝날 때 발견 상태를 바꾸는 규칙(자동 해결·재발)"""
+
+    def assert_status(self, fingerprint, status, module='fake'):
+        self.assertEqual(Finding.objects.get(fingerprint=fingerprint, module=module).status, status)
+
+    def events(self, fingerprint):
+        return list(FindingEvent.objects.filter(finding__fingerprint=fingerprint).order_by('id'))
+
+    def set_status(self, fingerprint, status):
+        Finding.objects.filter(fingerprint=fingerprint).update(status=status)
+
+    def test_처음_찾은_발견은_미해결이고_이력은_없다(self):
+        self.run_with(finding_data('fp-1'))
+
+        self.assert_status('fp-1', Finding.Status.OPEN)
+        self.assertEqual(self.events('fp-1'), [])
+
+    def test_다시_점검했는데_안_나온_미해결_발견은_해결됨으로_바꾸고_이력을_남긴다(self):
+        self.run_with(finding_data('fp-1'), finding_data('fp-2'))
+        second = self.run_with(finding_data('fp-2'))
+
+        self.assert_status('fp-1', Finding.Status.FIXED)
+        self.assert_status('fp-2', Finding.Status.OPEN)
+        [event] = self.events('fp-1')
+        self.assertEqual(
+            (event.from_status, event.to_status, event.run, event.user, event.reason),
+            (Finding.Status.OPEN, Finding.Status.FIXED, second, None, ''),
+        )
+        self.assertEqual(self.events('fp-2'), [])
+
+    def test_아무것도_안_나오면_미해결_발견을_모두_해결됨으로_바꾼다(self):
+        self.run_with(finding_data('fp-1'), finding_data('fp-2'))
+        passed = self.run_with()
+
+        self.assertEqual(passed.status, ModuleRun.Status.PASSED)
+        self.assertEqual(set(Finding.objects.values_list('status', flat=True)), {Finding.Status.FIXED})
+
+    def test_해결된_발견이_다시_나오면_미해결로_되돌리고_이력을_남긴다(self):
+        self.run_with(finding_data('fp-1'))
+        fixed_by = self.run_with()
+        again = self.run_with(finding_data('fp-1'))
+
+        self.assert_status('fp-1', Finding.Status.OPEN)
+        self.assertEqual(
+            [(e.from_status, e.to_status, e.run) for e in self.events('fp-1')],
+            [(Finding.Status.OPEN, Finding.Status.FIXED, fixed_by), (Finding.Status.FIXED, Finding.Status.OPEN, again)],
+        )
+
+    def test_해결된_발견이_이번에도_안_나오면_그대로_두고_이력을_더하지_않는다(self):
+        self.run_with(finding_data('fp-1'))
+        self.run_with()
+        self.run_with()
+
+        self.assert_status('fp-1', Finding.Status.FIXED)
+        self.assertEqual(len(self.events('fp-1')), 1)
+
+    def test_오탐과_위험_수용은_나오든_안_나오든_그대로_둔다(self):
+        self.run_with(finding_data('fp-1'), finding_data('fp-2'))
+        self.set_status('fp-1', Finding.Status.FALSE_POSITIVE)
+        self.set_status('fp-2', Finding.Status.RISK_ACCEPTED)
+
+        self.run_with(finding_data('fp-1'))
+
+        self.assert_status('fp-1', Finding.Status.FALSE_POSITIVE)
+        self.assert_status('fp-2', Finding.Status.RISK_ACCEPTED)
+        self.assertFalse(FindingEvent.objects.exists())
+
+    def test_칸이_실패하면_상태를_바꾸지_않는다(self):
+        self.run_with(finding_data('fp-1'))
+
+        failed = self.run_fake(FakeModule('fake', error=ScanError('저장소 폴더를 찾을 수 없습니다')))
+
+        self.assertEqual(failed.status, ModuleRun.Status.FAILED)
+        self.assert_status('fp-1', Finding.Status.OPEN)
+        self.assertFalse(FindingEvent.objects.exists())
+
+    def test_도구가_도는_중에_취소된_칸은_상태를_바꾸지_않는다(self):
+        self.run_with(finding_data('fp-1'))
+
+        def cancel_scan():
+            Scan.objects.get(status=Scan.Status.RUNNING).cancel()
+
+        cancelled = self.run_fake(FakeModule('fake', ModuleResult('1.0.0', b'[]'), during_run=cancel_scan))
+
+        self.assertEqual(cancelled.status, ModuleRun.Status.CANCELLED)
+        self.assert_status('fp-1', Finding.Status.OPEN)
+
+    def test_다른_모듈과_다른_대상의_발견은_건드리지_않는다(self):
+        self.run_with(finding_data('fp-1'), module='other')
+        first_target = self.target
+        self.target = make_target(self.project, '다른 저장소')
+        self.run_with(finding_data('fp-1'))
+        self.target = first_target
+
+        # 처음 대상의 fake 모듈만 다시 점검한다. 아무것도 안 나와도 다른 모듈·대상의 발견은 그대로다.
+        self.run_with()
+
+        self.assert_status('fp-1', Finding.Status.OPEN, module='other')
+        self.assertEqual(Finding.objects.get(module='fake').status, Finding.Status.OPEN)
+
+    def test_상태_기록이_실패하면_발견_저장과_상태_변경을_모두_되돌린다(self):
+        self.run_with(finding_data('fp-1'))
+
+        with patch('scans.tasks.FindingEvent.objects.bulk_create', side_effect=RuntimeError('DB 오류')):
+            with self.assertLogs('scans.tasks', 'ERROR'):
+                run = self.run_with(finding_data('fp-2'))
+
+        self.assertEqual(run.status, ModuleRun.Status.FAILED)
+        self.assert_status('fp-1', Finding.Status.OPEN)
+        self.assertFalse(Finding.objects.filter(fingerprint='fp-2').exists())
 
 
 class RunFindingListApiTests(TestCase):

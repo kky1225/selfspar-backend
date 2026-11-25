@@ -8,7 +8,7 @@ from django.conf import settings
 from django.db import close_old_connections, connection, transaction
 from django.utils import timezone
 
-from findings.models import Finding
+from findings.models import Finding, FindingEvent
 
 from .models import ModuleRun, Scan
 from .modules import MODULES_BY_KEY
@@ -216,6 +216,7 @@ def run_module(run):
             if not ModuleRun.objects.select_for_update().filter(pk=run.pk, status=ModuleRun.Status.RUNNING).exists():
                 return
             findings = save_findings(run, result.findings)
+            update_statuses(run, findings)
             finish(
                 run,
                 status=ModuleRun.Status.FOUND if findings else ModuleRun.Status.PASSED,
@@ -245,14 +246,16 @@ def save_findings(run, items):
     for item in items:
         unique.setdefault(item.fingerprint, item)
 
-    # 이미 있는 발견을 잠가 둔다. 정리 작업(cleanup_orphans)이 이어진 칸이 없는 발견을 지우는 중이면 끝날 때까지 기다린다.
-    # 그동안 지워진 발견은 여기서 읽히지 않아 아래에서 새로 만든다.
-    existing = {
+    # 이 대상·모듈의 발견을 모두 잠가 둔다.
+    # - 정리 작업(cleanup_orphans)이 이어진 칸이 없는 발견을 지우는 중이면 끝날 때까지 기다린다.
+    #   그동안 지워진 발견은 여기서 읽히지 않아 아래에서 새로 만든다.
+    # - 이어서 update_statuses가 이번에 안 나온 발견의 상태도 바꾸므로, 이번에 나온 것만이 아니라 전부 잠근다.
+    # 정리 작업과 같은 id 순서로 잠가서, 서로 상대가 쥔 줄을 기다리며 멈추는 일(교착)이 생기지 않는다.
+    locked = {
         finding.fingerprint: finding
-        for finding in Finding.objects.select_for_update().filter(
-            target=run.target, module=run.module, fingerprint__in=list(unique),
-        )
+        for finding in Finding.objects.select_for_update().filter(target=run.target, module=run.module).order_by('pk')
     }
+    existing = {fingerprint: locked[fingerprint] for fingerprint in unique if fingerprint in locked}
     for fingerprint, finding in existing.items():
         for field in REFRESHED_FIELDS:
             setattr(finding, field, getattr(unique[fingerprint], field))
@@ -271,6 +274,32 @@ def save_findings(run, items):
     findings = [*existing.values(), *new]
     run.findings.add(*findings)
     return findings
+
+
+def update_statuses(run, findings):
+    """이번 결과로 같은 대상·모듈 발견의 상태를 바꾼다. DefectDojo가 같은 점검 결과를 다시 가져올 때와 같은 규칙이다.
+    - 미해결인데 이번에 안 나온 발견: 해결됨
+    - 해결됨인데 이번에 다시 나온 발견: 미해결(재발)
+    - 오탐·위험 수용은 사람이 정한 상태라 나오든 안 나오든 그대로 둔다.
+    칸이 이상 없음이나 발견으로 끝날 때만 부른다. 실패·취소된 칸은 '안 나왔다'는 증거가 아니라서 부르지 않는다.
+    save_findings와 같은 트랜잭션 안에서 부른다."""
+    found = {finding.pk for finding in findings}
+    changes = {Finding.Status.FIXED: [], Finding.Status.OPEN: []}
+    # save_findings가 이미 잠근 줄이지만, 이 함수만 따로 불러도 안전하도록 여기서도 같은 순서로 잠근다.
+    for finding in Finding.objects.select_for_update().filter(
+        target=run.target, module=run.module, status__in=[Finding.Status.OPEN, Finding.Status.FIXED],
+    ).order_by('pk'):
+        if finding.status == Finding.Status.OPEN and finding.pk not in found:
+            changes[Finding.Status.FIXED].append(finding)
+        elif finding.status == Finding.Status.FIXED and finding.pk in found:
+            changes[Finding.Status.OPEN].append(finding)
+
+    events = []
+    for to_status, changed in changes.items():
+        if changed:
+            Finding.objects.filter(pk__in=[finding.pk for finding in changed]).update(status=to_status)
+            events += [FindingEvent(finding=finding, from_status=finding.status, to_status=to_status, run=run) for finding in changed]
+    FindingEvent.objects.bulk_create(events)
 
 
 def save_raw_output(run, raw_output):
