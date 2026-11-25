@@ -13,6 +13,11 @@ class Finding(models.Model):
         FALSE_POSITIVE = 'false_positive', '오탐'
         RISK_ACCEPTED = 'risk_accepted', '위험 수용'
 
+    # 사람이 고를 수 있는 상태. 해결됨은 다시 점검해서 안 나와야만 된다.
+    MANUAL_STATUSES = (Status.OPEN, Status.FALSE_POSITIVE, Status.RISK_ACCEPTED)
+    # 심각도별 위험 수용 최대 기간(일). 여기에 없는 심각도(치명·높음)는 위험 수용할 수 없다.
+    RISK_ACCEPT_MAX_DAYS = {'medium': 30, 'low': 90, 'info': 90}
+
     class Severity(models.TextChoices):
         CRITICAL = 'critical', '치명'
         HIGH = 'high', '높음'
@@ -49,10 +54,21 @@ class Finding(models.Model):
         constraints = [
             # 같은 대상·모듈 안에서 같은 발견은 한 줄만 둔다(중복 제거).
             models.UniqueConstraint(fields=['target', 'module', 'fingerprint'], name='unique_finding_per_target_module'),
+            # 위험 수용이면 만료일이 반드시 있고, 다른 상태면 반드시 비어 있다. 코드가 실수해도 DB가 막는다.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(status='risk_accepted', accepted_until__isnull=False)
+                    | (~models.Q(status='risk_accepted') & models.Q(accepted_until__isnull=True))
+                ),
+                name='accepted_until_only_when_risk_accepted',
+            ),
         ]
 
     def __str__(self):
         return f'{self.target.name} / {self.rule_id} / {self.location}'
+
+    def can_accept_risk(self):
+        return self.severity in self.RISK_ACCEPT_MAX_DAYS
 
 
 class FindingEvent(models.Model):
