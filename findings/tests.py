@@ -1,10 +1,14 @@
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.db import IntegrityError, transaction
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 
 from projects.models import Project
 from scans.models import ModuleRun, Scan
@@ -13,6 +17,7 @@ from scans.modules.base import ModuleResult, ScanError
 from scans.tasks import run_scan
 from scans.tests import FakeModule, finding_data, make_target
 
+from . import tasks
 from .models import Finding, FindingEvent
 
 
@@ -165,7 +170,7 @@ class FindingStatusTests(FindingRunTestCase):
     def test_오탐과_위험_수용은_나오든_안_나오든_그대로_둔다(self):
         self.run_with(finding_data('fp-1'), finding_data('fp-2'))
         self.set_status('fp-1', Finding.Status.FALSE_POSITIVE)
-        self.set_status('fp-2', Finding.Status.RISK_ACCEPTED)
+        self.accept_risk('fp-2')
 
         self.run_with(finding_data('fp-1'))
 
@@ -205,6 +210,38 @@ class FindingStatusTests(FindingRunTestCase):
 
         self.assert_status('fp-1', Finding.Status.OPEN, module='other')
         self.assertEqual(Finding.objects.get(module='fake').status, Finding.Status.OPEN)
+
+    def accept_risk(self, fingerprint, days=10):
+        Finding.objects.filter(fingerprint=fingerprint).update(
+            status=Finding.Status.RISK_ACCEPTED, accepted_until=timezone.localdate() + timedelta(days=days),
+        )
+
+    def test_위험_수용한_발견이_다시_나오며_높음_이상이_되면_미해결로_되돌린다(self):
+        medium = finding_data('fp-1')
+        medium.severity = 'medium'
+        self.run_with(medium)
+        self.accept_risk('fp-1')
+
+        raised = finding_data('fp-1')
+        raised.severity = 'high'
+        again = self.run_with(raised)
+
+        finding = Finding.objects.get(fingerprint='fp-1')
+        self.assertEqual((finding.status, finding.accepted_until), (Finding.Status.OPEN, None))
+        [event] = self.events('fp-1')
+        self.assertEqual((event.from_status, event.to_status, event.run), (Finding.Status.RISK_ACCEPTED, Finding.Status.OPEN, again))
+        self.assertIn('높음', event.reason)
+
+    def test_위험_수용한_발견이_같은_심각도로_다시_나오면_그대로_둔다(self):
+        medium = finding_data('fp-1')
+        medium.severity = 'medium'
+        self.run_with(medium)
+        self.accept_risk('fp-1')
+
+        self.run_with(medium)
+
+        self.assert_status('fp-1', Finding.Status.RISK_ACCEPTED)
+        self.assertEqual(self.events('fp-1'), [])
 
     def test_상태_기록이_실패하면_발견_저장과_상태_변경을_모두_되돌린다(self):
         self.run_with(finding_data('fp-1'))
@@ -310,3 +347,290 @@ class RunFindingListApiTests(TestCase):
 
     def test_로그인하지_않으면_403이다(self):
         self.assertEqual(self.get(self.make_run(), client=Client()).status_code, 403)
+
+    def test_상태와_위험_수용_만료일을_함께_돌려준다(self):
+        run = self.make_run()
+        finding = self.finding('fp-1', run, severity=Finding.Severity.MEDIUM)
+        until = timezone.localdate() + timedelta(days=5)
+        Finding.objects.filter(pk=finding.pk).update(status=Finding.Status.RISK_ACCEPTED, accepted_until=until)
+
+        [data] = self.get(run).json()['results']
+
+        self.assertEqual((data['status'], data['status_label'], data['accepted_until']), ('risk_accepted', '위험 수용', until.isoformat()))
+
+
+class FindingApiTestCase(TestCase):
+    """발견 하나를 다루는 API 테스트의 공통 준비"""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user('tester', password='correct-horse-battery')
+        self.client.force_login(self.user)
+        self.project = Project.objects.create(name='karaoke')
+        self.target = make_target(self.project)
+        self.today = timezone.localdate()
+
+    def make_finding(self, severity=Finding.Severity.MEDIUM, status=Finding.Status.OPEN, accepted_until=None, fingerprint='fp-1'):
+        return Finding.objects.create(
+            target=self.target, module='secrets', fingerprint=fingerprint, rule_id='r', title='t', severity=severity,
+            location='a:1', status=status, accepted_until=accepted_until,
+        )
+
+
+class FindingStatusApiTests(FindingApiTestCase):
+    """사람이 발견 상태를 바꾸는 API"""
+
+    def change(self, finding, client=None, **body):
+        return (client or self.client).post(
+            reverse('api_finding_status', args=[finding.pk]), body, content_type='application/json',
+        )
+
+    def days(self, n):
+        return (self.today + timedelta(days=n)).isoformat()
+
+    def test_오탐으로_바꾸면_사유와_바꾼_사람을_이력에_남긴다(self):
+        finding = self.make_finding()
+
+        response = self.change(finding, status='false_positive', reason='테스트용 가짜 키')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual((response.json()['status'], response.json()['status_label']), ('false_positive', '오탐'))
+        finding.refresh_from_db()
+        self.assertEqual((finding.status, finding.accepted_until), (Finding.Status.FALSE_POSITIVE, None))
+        [event] = finding.events.all()
+        self.assertEqual(
+            (event.from_status, event.to_status, event.reason, event.user, event.run),
+            (Finding.Status.OPEN, Finding.Status.FALSE_POSITIVE, '테스트용 가짜 키', self.user, None),
+        )
+
+    def test_보통은_30일까지_위험_수용할_수_있다(self):
+        finding = self.make_finding()
+
+        response = self.change(finding, status='risk_accepted', reason='관리자 화면에서만 씀', accepted_until=self.days(30))
+
+        self.assertEqual(response.status_code, 200)
+        finding.refresh_from_db()
+        self.assertEqual((finding.status, finding.accepted_until.isoformat()), (Finding.Status.RISK_ACCEPTED, self.days(30)))
+        self.assertEqual(finding.events.get().accepted_until.isoformat(), self.days(30))
+
+    def test_보통을_31일_넘게_위험_수용하면_400이다(self):
+        response = self.change(self.make_finding(), status='risk_accepted', reason='사유', accepted_until=self.days(31))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('30일', response.json()['accepted_until'][0])
+
+    def test_낮음과_정보는_90일까지_위험_수용할_수_있다(self):
+        for n, severity in enumerate([Finding.Severity.LOW, Finding.Severity.INFO]):
+            with self.subTest(severity=severity):
+                finding = self.make_finding(severity=severity, fingerprint=f'fp-{n}')
+                ok = self.change(finding, status='risk_accepted', reason='사유', accepted_until=self.days(90))
+                self.assertEqual(ok.status_code, 200)
+
+        too_long = self.make_finding(severity=Finding.Severity.LOW, fingerprint='fp-long')
+        self.assertEqual(self.change(too_long, status='risk_accepted', reason='사유', accepted_until=self.days(91)).status_code, 400)
+
+    def test_치명과_높음은_위험_수용할_수_없다(self):
+        for n, severity in enumerate([Finding.Severity.CRITICAL, Finding.Severity.HIGH]):
+            with self.subTest(severity=severity):
+                finding = self.make_finding(severity=severity, fingerprint=f'fp-{n}')
+                response = self.change(finding, status='risk_accepted', reason='사유', accepted_until=self.days(1))
+                self.assertEqual(response.status_code, 400)
+                self.assertIn('status', response.json())
+        self.assertFalse(FindingEvent.objects.exists())
+
+    def test_위험_수용_만료일은_내일_이후여야_하고_반드시_있어야_한다(self):
+        finding = self.make_finding()
+
+        for body in [{'accepted_until': self.days(0)}, {'accepted_until': self.days(-1)}, {}, {'accepted_until': None}]:
+            with self.subTest(body=body):
+                response = self.change(finding, status='risk_accepted', reason='사유', **body)
+                self.assertEqual(response.status_code, 400)
+                self.assertIn('accepted_until', response.json())
+        self.assertEqual(self.change(finding, status='risk_accepted', reason='사유', accepted_until=self.days(1)).status_code, 200)
+
+    def test_위험_수용_기한을_연장할_수_있고_이력이_남는다(self):
+        finding = self.make_finding(status=Finding.Status.RISK_ACCEPTED, accepted_until=self.today + timedelta(days=3))
+
+        response = self.change(finding, status='risk_accepted', reason='아직 고칠 버전이 없음', accepted_until=self.days(20))
+
+        self.assertEqual(response.status_code, 200)
+        finding.refresh_from_db()
+        self.assertEqual(finding.accepted_until.isoformat(), self.days(20))
+        event = finding.events.get()
+        self.assertEqual((event.from_status, event.to_status), (Finding.Status.RISK_ACCEPTED, Finding.Status.RISK_ACCEPTED))
+
+    def test_같은_만료일로_다시_위험_수용하면_400이다(self):
+        finding = self.make_finding(status=Finding.Status.RISK_ACCEPTED, accepted_until=self.today + timedelta(days=3))
+
+        response = self.change(finding, status='risk_accepted', reason='사유', accepted_until=self.days(3))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(FindingEvent.objects.exists())
+
+    def test_미해결로_되돌리면_만료일을_비운다(self):
+        finding = self.make_finding(status=Finding.Status.RISK_ACCEPTED, accepted_until=self.today + timedelta(days=3))
+
+        response = self.change(finding, status='open', reason='공개 화면에서도 쓰게 됨')
+
+        self.assertEqual(response.status_code, 200)
+        finding.refresh_from_db()
+        self.assertEqual((finding.status, finding.accepted_until), (Finding.Status.OPEN, None))
+
+    def test_위험_수용이_아닌데_만료일을_보내면_400이다(self):
+        response = self.change(self.make_finding(), status='false_positive', reason='사유', accepted_until=self.days(3))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('accepted_until', response.json())
+
+    def test_같은_상태로_바꾸면_400이다(self):
+        self.assertEqual(self.change(self.make_finding(), status='open', reason='사유').status_code, 400)
+
+    def test_해결됨은_고를_수_없다(self):
+        response = self.change(self.make_finding(), status='fixed', reason='고쳤음')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('다시 점검', response.json()['status'][0])
+
+    def test_해결된_발견은_바꿀_수_없다(self):
+        finding = self.make_finding(status=Finding.Status.FIXED)
+
+        response = self.change(finding, status='false_positive', reason='사유')
+
+        self.assertEqual(response.status_code, 409)
+        finding.refresh_from_db()
+        self.assertEqual(finding.status, Finding.Status.FIXED)
+
+    def test_사유는_반드시_1자에서_280자로_적는다(self):
+        finding = self.make_finding()
+
+        for reason in [None, '', '   ', '가' * 281]:
+            with self.subTest(reason=reason):
+                body = {} if reason is None else {'reason': reason}
+                response = self.change(finding, status='false_positive', **body)
+                self.assertEqual(response.status_code, 400)
+                self.assertIn('reason', response.json())
+        self.assertEqual(self.change(finding, status='false_positive', reason='가' * 280).status_code, 200)
+
+    def test_상태와_만료일만_저장하고_다른_칸은_덮어쓰지_않는다(self):
+        finding = self.make_finding()
+        real_create = FindingEvent.objects.create
+
+        # view가 발견을 읽은 뒤, 저장하기 전에 DB의 제목이 바뀐 상황을 만든다(이력을 남기는 순간에 바꾼다).
+        # view가 발견을 통째로 저장하면 읽어 둔 옛 제목('t')으로 덮어써서 이 테스트가 실패한다.
+        def title_changes_before_save(**kwargs):
+            Finding.objects.filter(pk=finding.pk).update(title='점검이 바꾼 제목')
+            return real_create(**kwargs)
+
+        with patch.object(FindingEvent.objects, 'create', title_changes_before_save):
+            self.assertEqual(self.change(finding, status='false_positive', reason='사유').status_code, 200)
+
+        finding.refresh_from_db()
+        self.assertEqual((finding.status, finding.title), (Finding.Status.FALSE_POSITIVE, '점검이 바꾼 제목'))
+
+    def test_없는_발견은_404이다(self):
+        response = self.client.post(
+            reverse('api_finding_status', args=[9999]), {'status': 'open', 'reason': '사유'}, content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_로그인하지_않으면_403이다(self):
+        response = self.change(self.make_finding(), client=Client(), status='false_positive', reason='사유')
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(FindingEvent.objects.exists())
+
+
+class FindingEventListApiTests(FindingApiTestCase):
+    """발견 상태 이력 조회 API"""
+
+    def test_최근_것부터_돌려주고_바꾼_사람이나_점검을_알려_준다(self):
+        finding = self.make_finding(status=Finding.Status.FALSE_POSITIVE)
+        scan = Scan.objects.create(project=self.project, status=Scan.Status.DONE)
+        run = ModuleRun.objects.create(scan=scan, target=self.target, module='secrets')
+        by_scan = FindingEvent.objects.create(finding=finding, from_status='open', to_status='fixed', run=run)
+        by_user = FindingEvent.objects.create(
+            finding=finding, from_status='fixed', to_status='false_positive', reason='테스트 키', user=self.user,
+        )
+
+        response = self.client.get(reverse('api_finding_events', args=[finding.pk]))
+
+        self.assertEqual(response.status_code, 200)
+        first, second = response.json()
+        self.assertEqual(
+            (first['id'], first['to_status_label'], first['reason'], first['username'], first['scan_id']),
+            (by_user.pk, '오탐', '테스트 키', 'tester', None),
+        )
+        self.assertEqual(
+            (second['id'], second['from_status_label'], second['to_status_label'], second['username'], second['scan_id']),
+            (by_scan.pk, '미해결', '해결됨', None, scan.pk),
+        )
+
+    def test_다른_발견의_이력은_섞지_않는다(self):
+        finding = self.make_finding()
+        other = self.make_finding(fingerprint='fp-2')
+        FindingEvent.objects.create(finding=other, from_status='open', to_status='fixed')
+
+        self.assertEqual(self.client.get(reverse('api_finding_events', args=[finding.pk])).json(), [])
+
+    def test_없는_발견은_404이고_로그인하지_않으면_403이다(self):
+        self.assertEqual(self.client.get(reverse('api_finding_events', args=[9999])).status_code, 404)
+        finding = self.make_finding()
+        self.assertEqual(Client().get(reverse('api_finding_events', args=[finding.pk])).status_code, 403)
+
+
+class ExpireRiskAcceptancesTests(FindingApiTestCase):
+    """기한이 지난 위험 수용을 미해결로 되돌리는 작업"""
+
+    def test_만료일이_지난_위험_수용은_미해결로_되돌리고_이력을_남긴다(self):
+        expired = self.make_finding(status=Finding.Status.RISK_ACCEPTED, accepted_until=self.today - timedelta(days=1))
+
+        with self.assertLogs('findings.tasks', 'INFO'):
+            tasks.expire_risk_acceptances()
+
+        expired.refresh_from_db()
+        self.assertEqual((expired.status, expired.accepted_until), (Finding.Status.OPEN, None))
+        [event] = expired.events.all()
+        self.assertEqual(
+            (event.from_status, event.to_status, event.reason, event.user, event.run),
+            (Finding.Status.RISK_ACCEPTED, Finding.Status.OPEN, tasks.EXPIRED_REASON, None, None),
+        )
+
+    def test_만료일_당일과_그_뒤는_그대로_둔다(self):
+        today = self.make_finding(status=Finding.Status.RISK_ACCEPTED, accepted_until=self.today)
+        later = self.make_finding(status=Finding.Status.RISK_ACCEPTED, accepted_until=self.today + timedelta(days=1), fingerprint='fp-2')
+
+        tasks.expire_risk_acceptances()
+
+        for finding in (today, later):
+            finding.refresh_from_db()
+            self.assertEqual(finding.status, Finding.Status.RISK_ACCEPTED)
+        self.assertFalse(FindingEvent.objects.exists())
+
+    def test_다른_상태는_건드리지_않는다(self):
+        for n, status in enumerate([Finding.Status.OPEN, Finding.Status.FIXED, Finding.Status.FALSE_POSITIVE]):
+            self.make_finding(status=status, fingerprint=f'fp-{n}')
+
+        tasks.expire_risk_acceptances()
+
+        self.assertEqual(
+            sorted(Finding.objects.values_list('status', flat=True)),
+            sorted([Finding.Status.OPEN, Finding.Status.FIXED, Finding.Status.FALSE_POSITIVE]),
+        )
+        self.assertFalse(FindingEvent.objects.exists())
+
+    def test_1시간마다_실행하도록_등록되어_있다(self):
+        entry = settings.CELERY_BEAT_SCHEDULE['expire-risk-acceptances']
+        self.assertEqual(entry['task'], tasks.expire_risk_acceptances.name)
+        self.assertEqual(entry['schedule'], 60 * 60.0)
+        self.assertEqual(entry['options']['expires'], 60 * 60)
+
+
+class AcceptedUntilConstraintTests(FindingApiTestCase):
+    """위험 수용일 때만 만료일이 있도록 DB가 막는다"""
+
+    def test_위험_수용인데_만료일이_없으면_저장되지_않는다(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.make_finding(status=Finding.Status.RISK_ACCEPTED, accepted_until=None)
+
+    def test_위험_수용이_아닌데_만료일이_있으면_저장되지_않는다(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.make_finding(status=Finding.Status.OPEN, accepted_until=self.today)

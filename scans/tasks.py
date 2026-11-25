@@ -280,26 +280,35 @@ def update_statuses(run, findings):
     """이번 결과로 같은 대상·모듈 발견의 상태를 바꾼다. DefectDojo가 같은 점검 결과를 다시 가져올 때와 같은 규칙이다.
     - 미해결인데 이번에 안 나온 발견: 해결됨
     - 해결됨인데 이번에 다시 나온 발견: 미해결(재발)
-    - 오탐·위험 수용은 사람이 정한 상태라 나오든 안 나오든 그대로 둔다.
+    - 위험 수용인데 다시 나오면서 심각도가 높음 이상으로 오른 발견: 미해결(높음 이상은 위험 수용할 수 없다)
+    - 그 밖의 오탐·위험 수용은 사람이 정한 상태라 나오든 안 나오든 그대로 둔다.
     칸이 이상 없음이나 발견으로 끝날 때만 부른다. 실패·취소된 칸은 '안 나왔다'는 증거가 아니라서 부르지 않는다.
-    save_findings와 같은 트랜잭션 안에서 부른다."""
+    save_findings와 같은 트랜잭션 안에서 부른다. 심각도는 save_findings가 이번 결과로 갱신한 뒤의 값을 본다."""
     found = {finding.pk for finding in findings}
-    changes = {Finding.Status.FIXED: [], Finding.Status.OPEN: []}
+    # (발견, 바뀔 상태, 사유)
+    changes = []
     # save_findings가 이미 잠근 줄이지만, 이 함수만 따로 불러도 안전하도록 여기서도 같은 순서로 잠근다.
     for finding in Finding.objects.select_for_update().filter(
-        target=run.target, module=run.module, status__in=[Finding.Status.OPEN, Finding.Status.FIXED],
+        target=run.target, module=run.module,
+        status__in=[Finding.Status.OPEN, Finding.Status.FIXED, Finding.Status.RISK_ACCEPTED],
     ).order_by('pk'):
         if finding.status == Finding.Status.OPEN and finding.pk not in found:
-            changes[Finding.Status.FIXED].append(finding)
+            changes.append((finding, Finding.Status.FIXED, ''))
         elif finding.status == Finding.Status.FIXED and finding.pk in found:
-            changes[Finding.Status.OPEN].append(finding)
+            changes.append((finding, Finding.Status.OPEN, ''))
+        elif finding.status == Finding.Status.RISK_ACCEPTED and finding.pk in found and not finding.can_accept_risk():
+            reason = f'심각도가 {finding.get_severity_display()}(으)로 올라 위험 수용을 풀었습니다.'
+            changes.append((finding, Finding.Status.OPEN, reason))
 
-    events = []
-    for to_status, changed in changes.items():
-        if changed:
-            Finding.objects.filter(pk__in=[finding.pk for finding in changed]).update(status=to_status)
-            events += [FindingEvent(finding=finding, from_status=finding.status, to_status=to_status, run=run) for finding in changed]
-    FindingEvent.objects.bulk_create(events)
+    for to_status in (Finding.Status.FIXED, Finding.Status.OPEN):
+        ids = [finding.pk for finding, status, _ in changes if status == to_status]
+        if ids:
+            # 미해결·해결됨에는 만료일이 없다. 위험 수용을 푼 발견의 만료일도 함께 비운다.
+            Finding.objects.filter(pk__in=ids).update(status=to_status, accepted_until=None)
+    FindingEvent.objects.bulk_create([
+        FindingEvent(finding=finding, from_status=finding.status, to_status=to_status, reason=reason, run=run)
+        for finding, to_status, reason in changes
+    ])
 
 
 def save_raw_output(run, raw_output):

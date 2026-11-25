@@ -140,6 +140,12 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': 24 * 60 * 60.0,
         'options': {'expires': 60 * 60},
     },
+    'expire-risk-acceptances': {
+        'task': 'findings.tasks.expire_risk_acceptances',
+        # 1시간마다. 만료일 다음 날 0시(한국 시각)가 지나고 늦어도 1시간 안에 미해결로 돌아간다.
+        'schedule': 60 * 60.0,
+        'options': {'expires': 60 * 60},
+    },
 }
 
 # 점검 도구가 낸 원본 결과 파일을 두는 폴더. docker-compose.yml에서 볼륨으로 붙인다.
