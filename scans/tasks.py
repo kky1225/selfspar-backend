@@ -1,5 +1,6 @@
 """worker가 실행하는 작업. web은 run_scan.delay(점검 번호)로 요청만 넣고 바로 응답한다."""
 import logging
+import re
 from datetime import timedelta
 
 from celery import shared_task
@@ -28,6 +29,12 @@ STALE_AFTER = timedelta(minutes=5)
 # (프로젝트 수 / 2 - 1) × 점검 하나의 시간이다. 예: 프로젝트 20개를 한꺼번에 넣어도 점검 하나가 13분 안에 끝나면 넘지 않는다.
 # 하루보다 짧아야 매일 도는 점검이 갇혀도 다음 날 점검을 막지 않는다.
 QUEUED_EXPIRES = timedelta(hours=2)
+# 어느 칸도 가리키지 않는 원본 결과 파일이라도 이만큼 지나야 지운다. 칸은 파일을 먼저 쓰고 결과를 저장하면서 경로를 적어서,
+# 그 사이에는 방금 쓴 파일도 가리키는 칸이 없어 보이기 때문이다.
+ORPHAN_FILE_MIN_AGE = timedelta(days=1)
+# save_raw_output이 만드는 폴더와 파일 이름. task-는 칸(ModuleRun)의 예전 이름(ScanTask) 때 만든 파일이다.
+RAW_OUTPUT_FOLDER = re.compile(r'scan-\d+')
+RAW_OUTPUT_FILE = re.compile(r'(run|task)-\d+-[\w-]+\.json')
 
 # 점검은 web의 취소 요청(ScanCancelApi)과 동시에 바뀔 수 있다. 그래서 상태는 읽고 나서 저장하지 않고,
 # "아직 그 상태일 때만 바꾼다"는 조건을 붙인 UPDATE 한 번으로 바꾼다. 바뀐 줄이 0이면 그 사이 취소된 것이다.
@@ -111,6 +118,61 @@ def cleanup_stale_scans():
                 logger.warning('점검 #%s는 %s 넘게 시작되지 않아서 취소함', scan_id, QUEUED_EXPIRES)
 
 
+@shared_task
+def cleanup_orphans():
+    """지운 점검이 남긴 것을 정리한다. Celery beat가 하루에 한 번 부른다(settings.CELERY_BEAT_SCHEDULE).
+    - 원본 결과 파일: 어느 칸도 가리키지 않는 파일. 점검을 지우거나, 파일을 쓴 뒤 취소된 칸에서 생긴다.
+    - 발견: 이어진 칸이 하나도 없는 발견. 그 발견을 본 점검을 모두 지우면 생긴다.
+    DB 줄을 지울 때 파일을 함께 지우지 않는 것은 Django와 같은 방식이다. 지우는 트랜잭션이 롤백되면 줄은 살아나는데 파일만 사라지기 때문이다.
+    발견을 먼저 정리한다. 파일 쪽에 문제가 있어도 발견 정리는 끝내기 위해서다."""
+    remove_orphan_findings()
+    remove_orphan_files()
+
+
+def remove_orphan_findings():
+    # 지우기 전에 잠그고 다시 확인한다. 그 사이 새 점검이 같은 발견을 찾아 다시 이었으면 지우지 않는다(save_findings도 같은 줄을 잠근다).
+    # of=('self',): 발견 줄만 잠근다. 칸과 잇는 표는 없는 쪽(LEFT JOIN의 빈 쪽)이라 잠글 수 없다.
+    with transaction.atomic():
+        ids = list(Finding.objects.select_for_update(of=('self',)).filter(runs=None).values_list('pk', flat=True))
+        if ids:
+            count, _ = Finding.objects.filter(pk__in=ids, runs=None).delete()
+            logger.info('이어진 칸이 없는 발견 %s개를 지움', count)
+
+
+def remove_orphan_files():
+    """결과 폴더에서 어느 칸도 가리키지 않는 원본 결과 파일과 빈 점검 폴더를 지운다.
+    save_raw_output이 만드는 모양(scan-N/run-M-모듈.json)만 본다. 결과 폴더를 실수로 넓은 곳으로 잡아도 다른 파일은 지우지 않는다.
+    심볼릭 링크는 따라가지 않는다. 폴더 하나를 정리하지 못해도 로그만 남기고 다음 폴더로 넘어간다."""
+    root = settings.SELFSPAR_SCAN_RESULTS_DIR
+    if not root.is_dir():
+        # worker에 결과 볼륨이 붙지 않은 설정 실수일 수 있어서 알려 둔다.
+        logger.warning('원본 결과 폴더 %s가 없어서 파일 정리를 건너뜀', root)
+        return
+
+    cutoff = (timezone.now() - ORPHAN_FILE_MIN_AGE).timestamp()
+    kept = set(ModuleRun.objects.exclude(raw_output_path='').values_list('raw_output_path', flat=True))
+    removed = 0
+    for folder in root.iterdir():
+        if folder.is_symlink() or not folder.is_dir() or not RAW_OUTPUT_FOLDER.fullmatch(folder.name):
+            continue
+        try:
+            for path in folder.iterdir():
+                if (
+                    not path.is_symlink() and path.is_file() and RAW_OUTPUT_FILE.fullmatch(path.name)
+                    and f'{folder.name}/{path.name}' not in kept and path.stat().st_mtime < cutoff
+                ):
+                    path.unlink()
+                    removed += 1
+            # 빈 폴더도 지운다. 칸이 폴더를 막 만들고 파일을 쓰기 전일 수 있어서 오래된 폴더만 지운다.
+            # 안의 파일을 지우면 폴더의 수정 시각이 지금으로 바뀌므로, 그런 폴더는 다음 정리 때 지워진다.
+            if not any(folder.iterdir()) and folder.stat().st_mtime < cutoff:
+                folder.rmdir()
+        except OSError:
+            logger.exception('원본 결과 폴더 %s를 정리하지 못함', folder)
+    if removed:
+        logger.info('어느 칸도 가리키지 않는 원본 결과 파일 %s개를 지움', removed)
+
+
 def run_module(run):
     """모듈 실행 하나를 돌리고 결과를 저장한다. 하나가 실패해도 다른 실행은 계속한다."""
     # 대기 중인 칸만 시작한다. 그 사이 취소된 칸은 건너뛴다.
@@ -183,9 +245,13 @@ def save_findings(run, items):
     for item in items:
         unique.setdefault(item.fingerprint, item)
 
+    # 이미 있는 발견을 잠가 둔다. 정리 작업(cleanup_orphans)이 이어진 칸이 없는 발견을 지우는 중이면 끝날 때까지 기다린다.
+    # 그동안 지워진 발견은 여기서 읽히지 않아 아래에서 새로 만든다.
     existing = {
         finding.fingerprint: finding
-        for finding in Finding.objects.filter(target=run.target, module=run.module, fingerprint__in=list(unique))
+        for finding in Finding.objects.select_for_update().filter(
+            target=run.target, module=run.module, fingerprint__in=list(unique),
+        )
     }
     for fingerprint, finding in existing.items():
         for field in REFRESHED_FIELDS:

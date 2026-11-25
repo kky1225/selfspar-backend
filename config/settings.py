@@ -133,6 +133,13 @@ CELERY_BEAT_SCHEDULE = {
         # worker가 꺼져 있는 동안 쌓인 요청은 worker가 다시 떴을 때 한꺼번에 돌지 않고 버린다. 다음 1분에 다시 들어온다.
         'options': {'expires': 60},
     },
+    'cleanup-orphans': {
+        'task': 'scans.tasks.cleanup_orphans',
+        # 하루에 한 번. 지운 점검이 남긴 파일과 발견이라 늦게 치워도 된다.
+        # beat를 새로 띄우면 그때부터 하루 뒤에 처음 실행된다.
+        'schedule': 24 * 60 * 60.0,
+        'options': {'expires': 60 * 60},
+    },
 }
 
 # 점검 도구가 낸 원본 결과 파일을 두는 폴더. docker-compose.yml에서 볼륨으로 붙인다.

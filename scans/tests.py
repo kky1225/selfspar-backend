@@ -20,6 +20,7 @@ from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
+from findings.models import Finding
 from projects.models import Project, Target
 
 from .models import ModuleRun, Scan
@@ -888,6 +889,197 @@ class CleanupStaleScansTests(TestCase):
         self.assertFalse(self.project.scans.filter(status__in=Scan.ACTIVE).exists())
 
 
+class CleanupOrphansTests(TestCase):
+    """지운 점검이 남긴 원본 결과 파일과 발견 정리(cleanup_orphans)"""
+
+    def setUp(self):
+        self.results_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.results_dir.cleanup)
+        self.root = Path(self.results_dir.name)
+        settings_patch = override_settings(SELFSPAR_SCAN_RESULTS_DIR=self.root)
+        settings_patch.enable()
+        self.addCleanup(settings_patch.disable)
+
+        self.project = Project.objects.create(name='karaoke')
+        self.target = make_target(self.project)
+        self.scan = Scan.objects.create(project=self.project, status=Scan.Status.DONE)
+        self.run = ModuleRun.objects.create(scan=self.scan, target=self.target, module='secrets', status=ModuleRun.Status.FOUND)
+        self.two_days_ago = (timezone.now() - timedelta(days=2)).timestamp()
+
+    def make_file(self, relative, old=True):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'{}')
+        if old:
+            os.utime(path, (self.two_days_ago, self.two_days_ago))
+        return path
+
+    def make_old(self, path):
+        os.utime(path, (self.two_days_ago, self.two_days_ago))
+
+    def make_finding(self, fingerprint, runs=()):
+        finding = Finding.objects.create(
+            target=self.target, module='secrets', fingerprint=fingerprint, rule_id='r', title='t', severity='high', location='a:1',
+        )
+        finding.runs.add(*runs)
+        return finding
+
+    def test_어느_칸도_가리키지_않는_오래된_파일은_지운다(self):
+        orphan = self.make_file('scan-99/run-1-secrets.json')
+
+        tasks.cleanup_orphans()
+
+        self.assertFalse(orphan.exists())
+
+    def test_칸이_가리키는_파일은_오래되어도_남긴다(self):
+        kept = self.make_file('scan-1/run-1-secrets.json')
+        ModuleRun.objects.filter(pk=self.run.pk).update(raw_output_path='scan-1/run-1-secrets.json')
+
+        tasks.cleanup_orphans()
+
+        self.assertTrue(kept.exists())
+
+    def test_방금_쓴_파일은_가리키는_칸이_없어도_남긴다(self):
+        # 칸이 파일을 쓰고 아직 경로를 적기 전인 경우
+        fresh = self.make_file('scan-1/run-2-secrets.json', old=False)
+
+        tasks.cleanup_orphans()
+
+        self.assertTrue(fresh.exists())
+
+    def test_오래된_빈_폴더는_지우고_방금_만든_빈_폴더는_남긴다(self):
+        old_folder = self.root / 'scan-98'
+        old_folder.mkdir()
+        self.make_old(old_folder)
+        new_folder = self.root / 'scan-97'
+        new_folder.mkdir()
+
+        tasks.cleanup_orphans()
+
+        self.assertFalse(old_folder.exists())
+        self.assertTrue(new_folder.exists())
+
+    def test_파일을_지워서_빈_폴더는_다음_정리_때_지운다(self):
+        orphan = self.make_file('scan-99/run-1-secrets.json')
+        self.make_old(orphan.parent)
+
+        tasks.cleanup_orphans()
+        self.assertFalse(orphan.exists())
+        # 파일을 지우면서 폴더의 수정 시각이 지금으로 바뀌었다.
+        self.assertTrue(orphan.parent.exists())
+
+        self.make_old(orphan.parent)
+        tasks.cleanup_orphans()
+        self.assertFalse(orphan.parent.exists())
+
+    def test_결과_폴더가_없으면_알리고_발견은_정리한다(self):
+        self.results_dir.cleanup()
+        orphan = self.make_finding('gone')
+
+        with self.assertLogs('scans.tasks', 'WARNING'):
+            tasks.cleanup_orphans()
+
+        self.assertFalse(Finding.objects.filter(pk=orphan.pk).exists())
+
+    def test_원본_결과_파일_모양이_아닌_것은_오래되어도_지우지_않는다(self):
+        others = [self.make_file('notes.txt'), self.make_file('scan-1/memo.txt'), self.make_file('backup/run-1-secrets.json')]
+
+        tasks.cleanup_orphans()
+
+        for path in others:
+            self.assertTrue(path.exists(), path)
+
+    def test_예전_이름의_원본_결과_파일도_가리키는_칸이_없으면_지운다(self):
+        orphan = self.make_file('scan-99/task-1-secrets.json')
+
+        tasks.cleanup_orphans()
+
+        self.assertFalse(orphan.exists())
+
+    def test_심볼릭_링크는_따라가지_않는다(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        target_file = Path(outside.name) / 'run-1-secrets.json'
+        target_file.write_bytes(b'{}')
+        os.utime(target_file, (self.two_days_ago, self.two_days_ago))
+        (self.root / 'scan-50').symlink_to(outside.name)
+        self.make_file('scan-51/run-1-secrets.json').unlink()
+        (self.root / 'scan-51' / 'run-2-secrets.json').symlink_to(target_file)
+
+        tasks.cleanup_orphans()
+
+        self.assertTrue(target_file.exists())
+        self.assertTrue((self.root / 'scan-51' / 'run-2-secrets.json').is_symlink())
+
+    def test_폴더_하나를_정리하지_못해도_다른_폴더는_정리한다(self):
+        stuck = self.make_file('scan-1/run-1-secrets.json')
+        orphan = self.make_file('scan-2/run-2-secrets.json')
+        real_unlink = Path.unlink
+
+        def fail_in_scan_1(path, *args, **kwargs):
+            if path.parent.name == 'scan-1':
+                raise PermissionError('막힘')
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, 'unlink', fail_in_scan_1), self.assertLogs('scans.tasks', 'ERROR'):
+            tasks.cleanup_orphans()
+
+        self.assertTrue(stuck.exists())
+        self.assertFalse(orphan.exists())
+
+    def test_이어진_칸이_없는_발견은_지우고_이어진_발견은_남긴다(self):
+        orphan = self.make_finding('gone')
+        linked = self.make_finding('seen', runs=[self.run])
+
+        with self.assertLogs('scans.tasks', 'INFO'):
+            tasks.cleanup_orphans()
+
+        self.assertFalse(Finding.objects.filter(pk=orphan.pk).exists())
+        self.assertTrue(Finding.objects.filter(pk=linked.pk).exists())
+
+    def test_점검을_지우면_그_점검만_본_발견은_다음_정리_때_지운다(self):
+        other_scan = Scan.objects.create(project=self.project, status=Scan.Status.DONE)
+        other_run = ModuleRun.objects.create(scan=other_scan, target=self.target, module='secrets')
+        only_here = self.make_finding('only', runs=[self.run])
+        both = self.make_finding('both', runs=[self.run, other_run])
+
+        self.scan.delete()
+        tasks.cleanup_orphans()
+
+        self.assertFalse(Finding.objects.filter(pk=only_here.pk).exists())
+        self.assertEqual(list(Finding.objects.get(pk=both.pk).runs.all()), [other_run])
+
+    def test_찾은_뒤에_새_점검이_다시_이은_발견은_지우지_않는다(self):
+        orphan = self.make_finding('back')
+        real_select_for_update = Finding.objects.select_for_update
+        selected = []
+
+        # 잠그며 고른 바로 뒤에 다른 점검이 같은 발견을 다시 이은 상황을 만든다. 고른 번호는 그대로 돌려준다.
+        def linked_after_select(*args, **kwargs):
+            selected.extend(real_select_for_update(*args, **kwargs).filter(runs=None).values_list('pk', flat=True))
+            orphan.runs.add(self.run)
+            return SimpleNamespace(filter=lambda **_: SimpleNamespace(values_list=lambda *_, **__: list(selected)))
+
+        with patch.object(Finding.objects, 'select_for_update', linked_after_select):
+            tasks.cleanup_orphans()
+
+        self.assertEqual(selected, [orphan.pk])
+        self.assertTrue(Finding.objects.filter(pk=orphan.pk).exists())
+
+    def test_지워진_발견이_다시_나오면_새로_만든다(self):
+        # 정리 작업이 먼저 지운 뒤에 저장하는 경우. 잠근 줄이 지워졌으면 읽히지 않아 새로 만든다.
+        self.make_finding('fp-1')
+        tasks.cleanup_orphans()
+
+        next_scan = Scan.objects.create(project=self.project, status=Scan.Status.RUNNING)
+        running = ModuleRun.objects.create(scan=next_scan, target=self.target, module='secrets', status=ModuleRun.Status.RUNNING)
+        with transaction.atomic():
+            findings = tasks.save_findings(running, [finding_data('fp-1')])
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(list(Finding.objects.get(fingerprint='fp-1').runs.all()), [running])
+
+
 class BeatScheduleTests(TestCase):
     def test_정리_작업을_1분마다_실행하도록_등록되어_있다(self):
         entry = settings.CELERY_BEAT_SCHEDULE['cleanup-stale-scans']
@@ -895,6 +1087,12 @@ class BeatScheduleTests(TestCase):
         self.assertEqual(entry['schedule'], 60.0)
         # worker가 꺼져 있던 동안 쌓인 요청은 버린다.
         self.assertEqual(entry['options']['expires'], 60)
+
+    def test_남은_파일과_발견_정리를_하루에_한_번_실행하도록_등록되어_있다(self):
+        entry = settings.CELERY_BEAT_SCHEDULE['cleanup-orphans']
+        self.assertEqual(entry['task'], tasks.cleanup_orphans.name)
+        self.assertEqual(entry['schedule'], 24 * 60 * 60.0)
+        self.assertEqual(entry['options']['expires'], 60 * 60)
 
 
 class RunCommandTests(TestCase):
