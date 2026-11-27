@@ -358,6 +358,15 @@ class RunFindingListApiTests(TestCase):
 
         self.assertEqual((data['status'], data['status_label'], data['accepted_until']), ('risk_accepted', '위험 수용', until.isoformat()))
 
+    def test_심각도별_위험_수용_최대_일수를_알려_준다(self):
+        run = self.make_run()
+        for severity in Finding.Severity.values:
+            self.finding(severity, run, severity=severity)
+
+        days = {item['severity']: item['max_accept_days'] for item in self.get(run).json()['results']}
+
+        self.assertEqual(days, {'critical': None, 'high': None, 'medium': 30, 'low': 90, 'info': 90})
+
 
 class FindingApiTestCase(TestCase):
     """발견 하나를 다루는 API 테스트의 공통 준비"""

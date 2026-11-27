@@ -11,13 +11,19 @@ class FindingSerializer(serializers.ModelSerializer):
     status_label = serializers.CharField(source='get_status_display', read_only=True)
     # 이 발견을 처음 본 점검 번호. view에서 계산해 붙인다.
     first_scan_id = serializers.IntegerField(read_only=True)
+    # 이 발견을 위험 수용할 수 있는 최대 일수. 위험 수용할 수 없는 심각도면 null이다.
+    # 화면이 같은 규칙을 따로 들고 있지 않도록 서버가 알려 준다.
+    max_accept_days = serializers.SerializerMethodField()
 
     class Meta:
         model = Finding
         fields = [
             'id', 'rule_id', 'title', 'severity', 'severity_label', 'location', 'evidence', 'extra',
-            'status', 'status_label', 'accepted_until', 'first_scan_id', 'created_at',
+            'status', 'status_label', 'accepted_until', 'max_accept_days', 'first_scan_id', 'created_at',
         ]
+
+    def get_max_accept_days(self, finding):
+        return Finding.RISK_ACCEPT_MAX_DAYS.get(finding.severity)
 
 
 class FindingStatusSerializer(serializers.Serializer):
